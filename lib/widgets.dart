@@ -11,6 +11,13 @@ const kPicked = Color(0xFFD81B60);
 const _availBg = Color(0xFFE6F4E8);
 const _usedBg = Color(0xFFEDEDED);
 
+/// 한글은 기본적으로 글자 사이 어디서든 줄이 바뀌어 단어가 중간에서 잘려 보인다("사용 중/인 좌석").
+/// 공백이 아닌 글자 사이에 줄바꿈 금지 문자(WORD JOINER, 보이지 않음)를 끼워서 띄어쓰기 자리에서만 줄이 바뀌게 한다.
+/// 여러 줄로 길게 나오는 안내 문장에 쓴다.
+extension KeepWords on String {
+  String get keepWords => replaceAllMapped(RegExp(r'(?<=\S)(?=\S)'), (_) => '\u2060');
+}
+
 /// 좌석 타일 안에 쓰는 짧은 남은 시간. 1시간 미만은 "45분", 이상은 "1:40"(1시간 40분).
 String compactRemaining(int minutes) {
   if (minutes < 60) return '$minutes분';
@@ -64,7 +71,7 @@ class UpdateBanner extends StatelessWidget {
         ]),
         if (notes.isNotEmpty) ...[
           const SizedBox(height: 8),
-          Text(notes, maxLines: 5, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12.5, height: 1.4, color: fg)),
+          Text(notes.keepWords, maxLines: 5, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12.5, height: 1.4, color: fg)),
         ],
         const SizedBox(height: 10),
         if (busy) ...[
@@ -84,7 +91,7 @@ class UpdateBanner extends StatelessWidget {
           if (blocked)
             Padding(
               padding: const EdgeInsets.only(top: 4),
-              child: Text('예약을 멈춘 뒤에 업데이트할 수 있어요. 설치하면 앱이 다시 시작돼요.',
+              child: Text('예약을 멈춘 뒤에 업데이트할 수 있어요. 설치하면 앱이 다시 시작돼요.'.keepWords,
                   style: TextStyle(fontSize: 12, color: fg)),
             ),
         ],

@@ -138,28 +138,62 @@ class Seat {
       );
 }
 
-class LibApi {
-  LibApi()
-      : _dio = Dio(BaseOptions(
-          baseUrl: _base,
-          connectTimeout: const Duration(seconds: 10),
-          receiveTimeout: const Duration(seconds: 10),
-          validateStatus: (_) => true,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-          },
-        ));
+/// 도서관 서버에 하는 요청. 예약 루프와 화면은 이 인터페이스만 쓰므로 시험에서 가짜로 바꿀 수 있다.
+abstract interface class LibraryApi {
+  /// 로그인한다. 학번/비밀번호가 거절되면 [LoginException], 서버가 일시적으로 이상하면 [ApiException].
+  Future<void> login(String uid, String pw);
+  Future<List<Room>> rooms();
+
+  /// 로그인이 풀렸거나 서버가 거부하면 [SessionException].
+  Future<List<Seat>> seats(int roomId);
+  Future<Map<String, dynamic>> reserve(int seatId);
+}
+
+class LibApi implements LibraryApi {
+  /// [dio] 는 시험에서 가짜 서버를 끼우려고 열어 둔 것이다.
+  LibApi({Dio? dio})
+      : _dio = dio ??
+            Dio(BaseOptions(
+              baseUrl: _base,
+              connectTimeout: const Duration(seconds: 10),
+              receiveTimeout: const Duration(seconds: 10),
+              validateStatus: (_) => true,
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+              },
+            ));
 
   final Dio _dio;
 
+  /// 응답을 JSON 으로 읽는다. 서버 오류(5xx)나 JSON 이 아닌 응답(점검 안내 HTML 등)은 일시적인 문제로 보고
+  /// [ApiException] 을 던진다. 이걸 로그인 실패나 세션 만료로 착각하면 안 된다.
   Map<String, dynamic> _json(Response r) {
+    final code = r.statusCode ?? 0;
+    if (code >= 500) throw ApiException('서버 오류 (HTTP $code)');
     final d = r.data;
-    if (d is Map<String, dynamic>) return d;
-    if (d is String) return jsonDecode(d) as Map<String, dynamic>;
-    throw const FormatException('예상하지 못한 응답');
+    try {
+      if (d is Map<String, dynamic>) return d;
+      if (d is String) {
+        final j = jsonDecode(d);
+        if (j is Map<String, dynamic>) return j;
+      }
+    } on FormatException {
+      // 아래에서 같이 처리
+    }
+    throw ApiException('예상하지 못한 응답 (HTTP $code)');
   }
 
+  /// JSON 모양이 예상과 다를 때(필드 누락, 타입 불일치)도 [ApiException] 하나로 모은다.
+  T _shape<T>(T Function() read) {
+    try {
+      return read();
+    } on TypeError {
+      throw ApiException('예상하지 못한 응답 모양');
+    }
+  }
+
+  @override
   Future<void> login(String uid, String pw) async {
     final r = await _dio.post('/api/login', data: {
       'loginId': uid,
@@ -171,30 +205,38 @@ class LibApi {
     if (j['success'] != true) {
       throw LoginException('${j['code']} ${j['message']}');
     }
-    final token = (j['data'] as Map?)?['accessToken'];
+    final data = j['data'];
+    final token = data is Map ? data['accessToken'] : null;
     if (token != null) _dio.options.headers['Pyxis-Auth-Token'] = token;
   }
 
   /// 열람실 목록. 로그인 없이 조회된다.
+  @override
   Future<List<Room>> rooms() async {
     final r = await _dio.get('/$_homepageId/seat-rooms',
         queryParameters: {'smufMethodCode': 'PC', 'branchGroupId': 1});
     final j = _json(r);
     if (j['success'] != true) throw ApiException('${j['code']} ${j['message']}');
-    final list = ((j['data'] as Map?)?['list'] as List?) ?? const [];
-    final rooms = list.map((e) => Room.fromJson(e as Map<String, dynamic>)).toList();
+    final rooms = _shape(() {
+      final list = ((j['data'] as Map?)?['list'] as List?) ?? const [];
+      return list.map((e) => Room.fromJson(e as Map<String, dynamic>)).toList();
+    });
     // 이용 가능한 열람실을 앞에 둔다 (각 그룹 안의 순서는 서버 순서 유지).
     return [...rooms.where((r) => r.chargeable), ...rooms.where((r) => !r.chargeable)];
   }
 
+  @override
   Future<List<Seat>> seats(int roomId) async {
     final r = await _dio.get('/$_homepageId/api/rooms/$roomId/seats');
     final j = _json(r);
     if (j['success'] != true) throw SessionException('${j['code']} ${j['message']}');
-    final list = (j['data'] as Map)['list'] as List;
-    return list.map((e) => Seat.fromJson(e as Map<String, dynamic>)).toList();
+    return _shape(() {
+      final list = (j['data'] as Map)['list'] as List;
+      return list.map((e) => Seat.fromJson(e as Map<String, dynamic>)).toList();
+    });
   }
 
+  @override
   Future<Map<String, dynamic>> reserve(int seatId) async {
     final r = await _dio.post('/$_homepageId/api/seat-charges', data: {
       'seatId': seatId,

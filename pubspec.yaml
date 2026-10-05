@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.1+2
+version: 1.0.2+3
 
 environment:
   sdk: ^3.10.3
@@ -43,6 +43,7 @@ dependencies:
   package_info_plus: ^10.2.1
   path_provider: ^2.1.6
   open_filex: ^4.7.0
+  flutter_local_notifications: ^22.3.1
 
 dev_dependencies:
   flutter_test:
@@ -54,9 +55,18 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
+
+# 앱 아이콘 (숭실대학교 심볼). 다시 만들려면: dart run flutter_launcher_icons
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon/icon.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/icon/icon_foreground.png"
 
 # The following section is specific to Flutter packages.
 flutter:
@@ -68,6 +78,19 @@ flutter:
 
   assets:
     - assets/layouts/
+    - assets/licenses/
+
+  # 앱 글꼴: Pretendard (SIL Open Font License 1.1, 라이선스 전문은 assets/licenses/Pretendard-OFL.txt).
+  # 앱이 쓰는 굵기(보통/중간/굵게)만 담아 용량을 아낀다.
+  fonts:
+    - family: Pretendard
+      fonts:
+        - asset: assets/fonts/Pretendard-Regular.otf
+          weight: 400
+        - asset: assets/fonts/Pretendard-Medium.otf
+          weight: 500
+        - asset: assets/fonts/Pretendard-Bold.otf
+          weight: 700
 
   # To add assets to your application, add an assets section, like this:
   # assets:

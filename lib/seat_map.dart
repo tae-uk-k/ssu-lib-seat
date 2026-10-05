@@ -400,8 +400,10 @@ class SeatMapPage extends StatelessWidget {
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             SeatMapLegend(layout: layout),
             const SizedBox(height: 4),
-            Text('한 손가락으로 이동, 두 손가락으로 확대/축소해요. 좌석을 눌러 고르면 숫자(우선순위)가 붙어요.\n'
-                '사용 중인 좌석 밑의 시간은 이용 종료까지 남은 시간이에요 (1:40 = 1시간 40분).',
+            Text(
+                ('한 손가락으로 이동, 두 손가락으로 확대/축소해요. 좌석을 눌러 고르면 숫자(우선순위)가 붙어요.\n'
+                        '사용 중인 좌석 밑의 시간은 이용 종료까지 남은 시간이에요 (1:40 = 1시간 40분).')
+                    .keepWords,
                 style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.outline)),
             const SizedBox(height: 8),
             Expanded(child: SeatMapView(layout: layout, seats: seats, selected: selected, onTap: onTap)),

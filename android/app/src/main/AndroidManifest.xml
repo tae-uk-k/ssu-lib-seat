@@ -4,7 +4,8 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 시간 제한이 없는 서비스 타입. dataSync 는 안드로이드 15 부터 6시간 뒤에 시스템이 끊는다. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- 앱 안 업데이트: 내려받은 APK 의 설치 창을 열려면 필요하다 (사용자가 "이 출처 허용"을 켜야 실제로 설치된다). -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- open_filex 플러그인이 끼워 넣는 저장소/미디어 읽기 권한. 앱 캐시 폴더의 APK 만 열므로 필요 없다. -->
@@ -43,10 +44,20 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- 알림 상태바 아이콘 (흰 단색). 앱 아이콘은 색이 있어서 상태바에서는 흰 사각형으로 보인다. -->
+        <meta-data
+            android:name="kr.ssu.libseat.NOTIFICATION_ICON"
+            android:resource="@drawable/ic_stat_notify" />
+        <!-- 예약 루프는 앱 안에서 도므로 앱이 밀려 꺼지면 서비스도 같이 끝낸다 (알림만 남는 좀비 방지). -->
         <service
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
-            android:foregroundServiceType="dataSync"
-            android:exported="false" />
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="true"
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="library_seat_availability_monitoring" />
+        </service>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

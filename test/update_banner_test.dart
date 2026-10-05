@@ -15,7 +15,7 @@ void main() {
     )));
     expect(find.text('새 버전 1.0.2이 나왔어요'), findsOneWidget);
     expect(find.text('지금 쓰는 버전 1.0.1'), findsOneWidget);
-    expect(find.text('좌석 밑에 남은 시간 표시'), findsOneWidget);
+    expect(find.text('좌석 밑에 남은 시간 표시'.keepWords), findsOneWidget);
     await tester.tap(find.text('업데이트'));
     expect(taps, 1);
   });
@@ -25,7 +25,7 @@ void main() {
     await tester.pumpWidget(_host(UpdateBanner(currentVersion: '1.0.1', newVersion: '1.0.2', blocked: true, onUpdate: () => taps++)));
     await tester.tap(find.text('업데이트'), warnIfMissed: false);
     expect(taps, 0);
-    expect(find.textContaining('예약을 멈춘 뒤에'), findsOneWidget);
+    expect(find.textContaining('예약을 멈춘 뒤에'.keepWords), findsOneWidget);
   });
 
   testWidgets('내려받는 중에는 진행률이 보이고 버튼은 사라진다', (tester) async {
