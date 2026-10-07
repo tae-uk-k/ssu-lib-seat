@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.4+5
+version: 1.0.5+6
 
 environment:
   sdk: ^3.10.3
@@ -44,6 +44,7 @@ dependencies:
   path_provider: ^2.1.6
   open_filex: ^4.7.0
   flutter_local_notifications: ^22.3.1
+  url_launcher: ^6.3.2
 
 dev_dependencies:
   flutter_test:
@@ -67,6 +68,13 @@ flutter_launcher_icons:
   image_path: "assets/icon/icon.png"
   adaptive_icon_background: "#FFFFFF"
   adaptive_icon_foreground: "assets/icon/icon_foreground.png"
+  windows:
+    generate: true
+    image_path: "assets/icon/icon.png"
+    icon_size: 256
+  macos:
+    generate: true
+    image_path: "assets/icon/icon.png"
 
 # The following section is specific to Flutter packages.
 flutter:
@@ -79,6 +87,7 @@ flutter:
   assets:
     - assets/layouts/
     - assets/licenses/
+    - assets/icon/toast_icon.png # Windows 알림에 붙는 앱 아이콘 (tools/make_toast_icon.py 로 만든다)
 
   # 앱 글꼴: Pretendard (SIL Open Font License 1.1, 라이선스 전문은 assets/licenses/Pretendard-OFL.txt).
   # 앱이 쓰는 굵기(보통/중간/굵게)만 담아 용량을 아낀다.

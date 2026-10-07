@@ -16,6 +16,7 @@ Map<String, dynamic> _release({
 }) =>
     {
       'tag_name': tag,
+      'html_url': 'https://github.com/tae-uk-k/ssu-lib-seat/releases/tag/$tag',
       'draft': draft,
       'prerelease': prerelease,
       'body': body,
@@ -82,6 +83,19 @@ void main() {
       expect(u.apkSize, 3);
       expect(u.sha256, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
       expect(u.notes, '좌석 밑 남은 시간 표시');
+    });
+    test('릴리스 웹 페이지 주소도 뽑는다 (컴퓨터용 앱은 APK 대신 이 페이지를 연다)', () {
+      expect(parseRelease(_release())!.pageUrl, 'https://github.com/tae-uk-k/ssu-lib-seat/releases/tag/v1.0.3');
+      final j = _release()..remove('html_url');
+      expect(parseRelease(j)!.pageUrl, ''); // 없으면 빈 값 (화면이 기본 주소를 쓴다)
+    });
+    test('컴퓨터용 파일(zip)이 함께 올라와 있어도 APK 를 찾는다', () {
+      final j = _release(assets: [
+        {'name': 'ssu-lib-seat-1.0.3-windows.zip', 'browser_download_url': 'https://x/w.zip', 'size': 9},
+        {'name': 'ssu-lib-seat-1.0.3-macos.zip', 'browser_download_url': 'https://x/m.zip', 'size': 9},
+        {'name': 'ssu-lib-seat-1.0.3.apk', 'browser_download_url': 'https://x/a.apk', 'size': 5},
+      ]);
+      expect(parseRelease(j)!.apkName, 'ssu-lib-seat-1.0.3.apk');
     });
     test('초안, 시험판, APK 없음은 null', () {
       expect(parseRelease(_release(draft: true)), isNull);

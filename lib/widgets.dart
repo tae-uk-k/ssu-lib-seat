@@ -3,8 +3,12 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import 'api.dart';
+import 'run_state.dart';
 
 const kGreen = Color(0xFF2E7D32);
+
+/// 앱 바탕색. 카드는 흰색이라 이 연한 회색 위에서 또렷하게 보인다.
+const kAppBg = Color(0xFFF4F5F9);
 
 /// 내가 고른 좌석 색. 도면의 구역 색(파랑·금색·청록·연파랑)과 겹치지 않는 분홍 계열.
 const kPicked = Color(0xFFD81B60);
@@ -16,6 +20,70 @@ const _usedBg = Color(0xFFEDEDED);
 /// 여러 줄로 길게 나오는 안내 문장에 쓴다.
 extension KeepWords on String {
   String get keepWords => replaceAllMapped(RegExp(r'(?<=\S)(?=\S)'), (_) => '\u2060');
+}
+
+/// 진행 기록 화면. 새 기록이 생기면 이 화면만 갱신된다.
+class RunLogPage extends StatelessWidget {
+  const RunLogPage({super.key, required this.log});
+
+  final RunLog log;
+
+  /// "12:34:56  내용" 모양의 한 줄을 시각(흐리게)과 내용으로 나눠 그린다.
+  static Widget _line(BuildContext context, String line) {
+    final dim = Theme.of(context).colorScheme.outline;
+    final hasTime = line.length > 10 && line[2] == ':' && line[5] == ':';
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Text.rich(
+        TextSpan(children: [
+          if (hasTime) TextSpan(text: '${line.substring(0, 8)}  ', style: TextStyle(color: dim)),
+          TextSpan(text: hasTime ? line.substring(10) : line),
+        ]),
+        style: const TextStyle(fontSize: 12.5, height: 1.35),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('진행 기록')),
+        body: ListenableBuilder(
+          listenable: log,
+          builder: (context, _) => log.length == 0
+              ? Center(child: Text('아직 기록이 없어요.', style: TextStyle(color: Theme.of(context).colorScheme.outline)))
+              : ListView.builder(
+                  // 가장 새 기록이 맨 위에 온다 (기록이 몇 줄 안 될 때도 위에서부터 읽힌다).
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                  itemCount: log.length,
+                  itemBuilder: (context, i) => _line(context, log[log.length - 1 - i]),
+                ),
+        ),
+      );
+}
+
+/// 화면 위쪽에 띄우는 안내 카드(실행 중, 결과). 왼쪽 아이콘과 오른쪽 내용의 모양을 한 곳에서 맞춘다.
+class BannerCard extends StatelessWidget {
+  const BannerCard({super.key, required this.color, required this.leading, required this.child, this.trailing});
+
+  final Color color;
+
+  /// 24x24 칸의 가운데에 놓이는 아이콘(또는 진행 표시).
+  final Widget leading;
+  final Widget child;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: EdgeInsets.fromLTRB(14, 12, trailing == null ? 14 : 4, 12),
+        decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(16)),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SizedBox(width: 24, height: 24, child: Center(child: leading)),
+          const SizedBox(width: 12),
+          Expanded(child: child),
+          ?trailing,
+        ]),
+      );
 }
 
 /// 좌석 타일 안에 쓰는 짧은 남은 시간. 1시간 미만은 "45분", 이상은 "1:40"(1시간 40분).
@@ -33,6 +101,7 @@ String longRemaining(int minutes) {
 }
 
 /// 새 버전 안내 카드. [progress] 가 있으면 내려받는 중, [blocked] 이면 예약이 도는 중이라 업데이트를 막는다.
+/// [desktop] 이면 컴퓨터용 앱이라 APK 를 설치하는 대신 내려받는 웹 페이지를 연다.
 class UpdateBanner extends StatelessWidget {
   const UpdateBanner({
     super.key,
@@ -43,11 +112,12 @@ class UpdateBanner extends StatelessWidget {
     this.progress,
     this.busy = false,
     this.blocked = false,
+    this.desktop = false,
   });
 
   final String currentVersion, newVersion, notes;
   final double? progress;
-  final bool busy, blocked;
+  final bool busy, blocked, desktop;
   final VoidCallback onUpdate;
 
   @override
@@ -57,7 +127,7 @@ class UpdateBanner extends StatelessWidget {
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(color: scheme.secondaryContainer, borderRadius: BorderRadius.circular(14)),
+      decoration: BoxDecoration(color: scheme.secondaryContainer, borderRadius: BorderRadius.circular(16)),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
           Icon(Icons.system_update, color: fg),
@@ -84,10 +154,16 @@ class UpdateBanner extends StatelessWidget {
             width: double.infinity,
             child: FilledButton.icon(
               onPressed: blocked ? null : onUpdate,
-              icon: const Icon(Icons.download),
-              label: const Text('업데이트'),
+              icon: Icon(desktop ? Icons.open_in_browser : Icons.download),
+              label: Text(desktop ? '다운로드 페이지 열기' : '업데이트'),
             ),
           ),
+          if (desktop)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text('새 버전을 내려받아 압축을 풀고, 이 앱을 닫은 뒤 새 파일로 실행해 주세요.'.keepWords,
+                  style: TextStyle(fontSize: 12, color: fg)),
+            ),
           if (blocked)
             Padding(
               padding: const EdgeInsets.only(top: 4),

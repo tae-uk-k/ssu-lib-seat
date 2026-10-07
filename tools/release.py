@@ -75,10 +75,62 @@ def cert_sha256(apk):
     return m.group(1).lower()
 
 
+WINDOWS_README = """도서관 좌석 예약 (Windows)
+
+처음 쓰는 방법
+1. 이 압축 파일을 원하는 폴더에 풀어 주세요. (압축 파일 안에서 바로 실행하면 안 돼요.)
+2. ssu_lib_seat.exe 를 실행하세요.
+3. "Windows의 PC 보호" 창이 뜨면 "추가 정보" 를 누르고 "실행" 을 눌러 주세요.
+   (서명하지 않은 프로그램이라 처음 한 번 나오는 안내예요.)
+4. 학번과 비밀번호는 이 컴퓨터 안에 암호화해서 저장돼요. 어디로도 전송되지 않아요.
+
+알아둘 점
+- 예약이 도는 동안 창을 닫으면 예약도 멈춰요. 최소화는 괜찮아요.
+- 예약하는 동안에는 컴퓨터가 잠자기에 들어가지 않아요.
+- 예약이 끝나면 Windows 알림으로 알려 줘요. 알림이 안 보이면
+  설정 > 시스템 > 알림 에서 "도서관 좌석 예약" 이 켜져 있는지 확인해 주세요.
+- 새 버전이 나오면 앱 맨 위에 안내가 떠요. 다운로드 페이지에서 새 압축 파일을 받아 같은 방법으로 풀어 주세요.
+"""
+
+# Windows 에서 Flutter 프로그램이 돌려면 필요한 시스템 파일. 깨끗한 PC 에는 없을 수 있어서 프로그램 옆에 같이 넣는다.
+VC_RUNTIME_DLLS = ['msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll']
+
+
+def package_windows(version):
+    """flutter build windows 결과를 압축 파일(zip)로 묶는다. 만든 zip 경로를 돌려준다."""
+    src = os.path.join(ROOT, 'build', 'windows', 'x64', 'runner', 'Release')
+    exe = os.path.join(src, 'ssu_lib_seat.exe')
+    if not os.path.exists(exe):
+        die('Windows 프로그램이 만들어지지 않았어요: ' + exe)
+    name = 'ssu-lib-seat-%s-windows' % version
+    stage_root = os.path.join(ROOT, 'build', name)
+    shutil.rmtree(stage_root, ignore_errors=True)
+    stage = os.path.join(stage_root, 'SSU-LibSeat')  # 압축을 풀면 이 폴더가 나온다
+    shutil.copytree(src, stage)
+    sysdir = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')
+    missing = []
+    for dll in VC_RUNTIME_DLLS:
+        p = os.path.join(sysdir, dll)
+        if os.path.exists(p):
+            shutil.copyfile(p, os.path.join(stage, dll))
+        else:
+            missing.append(dll)
+    if missing:
+        print('[주의] 시스템 파일을 찾지 못해 넣지 못했어요: ' + ', '.join(missing))
+    open(os.path.join(stage, '읽어주세요.txt'), 'w', encoding='utf-8-sig', newline='\r\n').write(WINDOWS_README)
+    zip_path = os.path.join(ROOT, 'build', name + '.zip')
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+    shutil.make_archive(os.path.join(ROOT, 'build', name), 'zip', root_dir=stage_root)
+    print('Windows 압축 파일: %s (%.1f MB)' % (zip_path, os.path.getsize(zip_path) / 1048576))
+    return zip_path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('notes', nargs='?', default='', help='릴리스 설명 (앱의 업데이트 안내에 그대로 보인다)')
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--no-windows', action='store_true', help='Windows 프로그램은 만들지 않는다 (APK 만 릴리스)')
     ap.add_argument('--trailer', default='', help='커밋 메시지 맨 끝에만 붙는 줄 (예: Co-Authored-By: ...). 릴리스 설명에는 안 들어간다')
     args = ap.parse_args()
 
@@ -123,8 +175,21 @@ def main():
             '       기존 지문: %s\n       이번 지문: %s' % (pinned, cert))
     print('서명 확인: ' + ('기존 릴리스와 같은 키예요.' if pinned else '첫 릴리스라 이 지문을 기준으로 저장해요.'))
 
+    win_zip = None
+    if not args.no_windows:
+        r = run(['flutter', 'build', 'windows', '--release', '--build-name', new, '--build-number', str(new_build)],
+                check=False)
+        if r.returncode != 0:
+            # Windows 때문에 폰 업데이트까지 못 내보내는 일이 없도록, 건너뛰는 방법을 알려 주고 멈춘다 (아직 아무것도 올리지 않았다).
+            die('Windows 프로그램 빌드에 실패했어요. 아직 버전, git, GitHub 는 바뀌지 않았어요.\n'
+                '       폰 앱(APK)만 올리려면 --no-windows 를 붙여 다시 실행하세요.\n'
+                '       (Windows 빌드에는 Visual Studio 와 Windows 개발자 모드가 필요해요.)')
+        win_zip = package_windows(new)
+
     if args.dry_run:
         print('\n[dry-run] 여기까지만 했어요. 버전, git, GitHub 는 바뀌지 않았어요.\nAPK: ' + built)
+        if win_zip:
+            print('Windows: ' + win_zip)
         return
 
     apk = os.path.join(ROOT, 'build', 'ssu-lib-seat-%s.apk' % new)
@@ -148,8 +213,10 @@ def main():
     run(['git', 'tag', tag])
     run(['git', 'push', 'origin', 'HEAD'])
     run(['git', 'push', 'origin', tag])
-    run(['gh', 'release', 'create', tag, apk, '--title', tag, '--notes-file', notes_file, '--latest'])
+    files = [apk] + ([win_zip] if win_zip else [])
+    run(['gh', 'release', 'create', tag] + files + ['--title', tag, '--notes-file', notes_file, '--latest'])
     print('\n완료! 폰의 앱을 켜면 %s 업데이트 버튼이 나타나요.' % new)
+    print('macOS 앱은 GitHub 가 자동으로 만들어 몇 분 뒤 이 릴리스에 올려 줘요 (Actions 탭에서 진행 상황을 볼 수 있어요).')
 
 
 if __name__ == '__main__':

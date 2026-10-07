@@ -9,18 +9,20 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
+import 'auto_renewer.dart';
 import 'reservation_runner.dart';
 import 'run_state.dart';
 import 'seat_layout.dart';
 import 'seat_map.dart';
 import 'services.dart';
+import 'shared_login.dart';
 import 'update_check.dart';
 import 'widgets.dart';
 
 void main() {
   runZonedGuarded(() {
     WidgetsFlutterBinding.ensureInitialized();
-    // 잡히지 않은 오류를 기록해 둔다. 폰에서 문제가 생기면 "고급 설정 > 오류 기록"에서 복사해 보낼 수 있다.
+    // 잡히지 않은 오류를 기록해 둔다. 폰에서 문제가 생기면 "메뉴 > 오류 기록"에서 복사해 보낼 수 있다.
     FlutterError.onError = (details) {
       FlutterError.presentError(details);
       CrashLog.record(details.exception, details.stack);
@@ -45,7 +47,27 @@ class App extends StatelessWidget {
           colorSchemeSeed: Colors.indigo,
           useMaterial3: true,
           fontFamily: 'Pretendard',
-          scaffoldBackgroundColor: const Color(0xFFF4F5F9),
+          scaffoldBackgroundColor: kAppBg,
+          appBarTheme: const AppBarTheme(
+            backgroundColor: kAppBg,
+            surfaceTintColor: Colors.transparent,
+            scrolledUnderElevation: 0,
+            centerTitle: false,
+            titleTextStyle: TextStyle(fontFamily: 'Pretendard', fontSize: 19, fontWeight: FontWeight.bold, color: Color(0xFF1B1B1F)),
+          ),
+          inputDecorationTheme: InputDecorationTheme(border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
+          filledButtonTheme: FilledButtonThemeData(
+            style: FilledButton.styleFrom(shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+          ),
+          dialogTheme: DialogThemeData(
+            backgroundColor: Colors.white,
+            surfaceTintColor: Colors.transparent,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          ),
+          snackBarTheme: SnackBarThemeData(
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ),
         ),
         home: services.wrapRoot(HomePage(services: services)),
       );
@@ -79,7 +101,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final _pw = TextEditingController();
   final _interval = TextEditingController(text: '1.5');
   final _range = TextEditingController();
-  final _logScroll = ScrollController();
 
   late LibraryApi _api = widget.services.newApi();
   bool _loggedIn = false;
@@ -102,11 +123,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   /// 시작 중, 도는 중, 멈추는 중 모두 true. 설정을 바꾸는 컨트롤을 잠그는 데 쓴다.
   bool get _running => _phase != _Phase.idle;
-  ReservationRunner? _runner;
-  RunStatus? _runStatus;
+  ReservationRunner? _runner; // 좌석을 노리는 중일 때만 있다 (좌석을 받으면 끝난다)
+  SeatRenewer? _renewer; // 자동 연장이 켜져 있으면 예약이 시작될 때부터 끝날 때까지 같이 돈다
+  // 조회마다 바뀌는 값은 화면 전체가 아니라 실행 배너만 다시 그리도록 따로 둔다.
+  final _runStatus = ValueNotifier<RunStatus?>(null);
+  final _renewStatus = ValueNotifier<RenewStatus?>(null);
   _Notice? _lastResult;
   DateTime? _lastBeat;
   DateTime? _lastNotif;
+  String? _lastServiceText;
+
+  /// 이용 종료 전에 내 좌석을 자동으로 연장할지. 기본으로 켜져 있다.
+  bool _autoRenew = true;
   List<String> _crashes = [];
 
   /// 배터리 최적화에서 제외돼 있는지. 아니면 화면을 꺼 둘 때 폰이 앱을 멈출 수 있다.
@@ -118,7 +146,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _checkingUpdate = false;
   bool _updating = false;
   double? _updateProgress;
-  final List<String> _logs = [];
+  final _runLog = RunLog(); // 진행 기록 (메뉴에서 연다)
 
   Room? get _room {
     for (final r in _rooms) {
@@ -154,9 +182,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   /// 처음 실행할 때 한 번만, 배터리 제한을 풀어야 하는 이유를 알리고 시스템 허용 창을 띄운다.
-  /// 거절해도 다시 묻지 않는다 (고급 설정에서 언제든 다시 할 수 있다).
+  /// 거절해도 다시 묻지 않는다 (메뉴에서 언제든 다시 할 수 있다).
   Future<void> _offerBatteryOnce() async {
-    if (_batteryOk || !mounted) return;
+    if (_batteryOk || widget.services.desktop || !mounted) return; // 배터리 제한은 폰에만 있다
     final p = await SharedPreferences.getInstance();
     if (p.getBool('batteryAsked') == true || !mounted) return;
     await p.setBool('batteryAsked', true);
@@ -192,7 +220,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() => _lastResult = _Notice(
           title: '지난 예약이 중간에 멈췄어요',
           body: '$what감시가 ${_hm(r.lastCheck)}에 마지막으로 확인된 뒤 멈췄어요. '
-              '앱을 최근 앱 목록에서 밀어서 끄거나 시스템이 앱을 종료하면 예약도 함께 멈춰요. '
+              '${widget.services.desktop ? '창을 닫거나 앱이 종료되면' : '앱을 최근 앱 목록에서 밀어서 끄거나 시스템이 앱을 종료하면'} 예약도 함께 멈춰요. '
               '다시 하려면 아래에서 예약을 시작해 주세요.',
         ));
   }
@@ -201,20 +229,45 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ---------- 업데이트 ----------
 
+  static const _updateCheckEvery = Duration(hours: 6);
+
+  /// 최근에 확인했고 그때 새 버전이 없었는지. 앱을 켤 때마다 서버에 묻지 않으려고 쓴다.
+  Future<bool> _checkedRecently() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final at = p.getInt('updateCheckedAt');
+      if (at == null) return false;
+      final age = DateTime.now().millisecondsSinceEpoch - at;
+      return age >= 0 && age < _updateCheckEvery.inMilliseconds;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _markUpdateChecked() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setInt('updateCheckedAt', DateTime.now().millisecondsSinceEpoch);
+    } catch (_) {}
+  }
+
   /// 새 버전이 있는지 확인한다. 앱을 켤 때는 조용히(실패해도 아무 말 없이), 직접 누르면 결과를 알려 준다.
+  /// 켤 때는 최근에 "새 버전 없음"으로 확인했다면 서버에 다시 묻지 않는다 (새 버전이 있다고 나온 동안은 매번 확인해 안내를 보여 준다).
   Future<void> _checkUpdate({bool manual = false}) async {
     if (_checkingUpdate || _updating) return;
     setState(() => _checkingUpdate = true);
     try {
       final current = (await PackageInfo.fromPlatform()).version;
       if (mounted) setState(() => _version = current);
+      if (!manual && await _checkedRecently()) return;
       final latest = await widget.services.updater.latest();
       if (!mounted) return;
       if (latest != null && isNewerVersion(current, latest.version)) {
         setState(() => _update = latest);
         if (manual) _toast('새 버전 ${latest.version}이 있어요. 맨 위의 업데이트 버튼을 눌러 주세요.');
-      } else if (manual) {
-        _toast('최신 버전이에요. ($current)');
+      } else {
+        unawaited(_markUpdateChecked());
+        if (manual) _toast('최신 버전이에요. ($current)');
       }
     } on UpdateException catch (e) {
       if (manual) _toast(e.message);
@@ -226,9 +279,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   /// 새 APK 를 내려받아 안드로이드 설치 창을 연다. 설치하면 앱이 꺼졌다 다시 켜지므로 예약이 도는 중에는 막는다.
+  /// 컴퓨터용 앱은 APK 를 설치할 수 없어서, 새 버전을 내려받는 릴리스 웹 페이지를 열어 준다 (예약은 계속 돌아도 된다).
   Future<void> _installUpdate() async {
     final u = _update;
     if (u == null || _updating) return;
+    if (widget.services.desktop) {
+      final url = u.pageUrl.isNotEmpty ? u.pageUrl : 'https://github.com/$updateRepo/releases/latest';
+      final ok = await widget.services.openUrl(url);
+      if (!ok) _toast('브라우저를 열지 못했어요. 주소를 직접 열어 주세요: $url');
+      return;
+    }
     if (_running) {
       _toast('예약을 멈춘 뒤에 업데이트해 주세요.');
       return;
@@ -281,6 +341,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _pw.text = pw ?? '';
       _savePw = pw != null || id == null;
       _interval.text = p.getString('interval') ?? '1.5';
+      _autoRenew = p.getBool('autoRenew') ?? true;
       _roomId = roomId;
       _selected = p.getStringList('sel_$roomId') ?? [];
     });
@@ -322,6 +383,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       await p.setInt('roomId', _roomId!);
       await p.setStringList('sel_$_roomId', _selected);
     }
+  }
+
+  Future<void> _setAutoRenew(bool on) async {
+    if (_running) return;
+    setState(() => _autoRenew = on);
+    final p = await SharedPreferences.getInstance();
+    await p.setBool('autoRenew', on);
   }
 
   /// 계정과 확인 간격. 계정은 기기 암호화 저장소에 쓰므로 좌석을 누를 때마다 쓰지 않는다.
@@ -366,14 +434,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _log(String m) {
     if (!mounted) return;
-    final t = DateTime.now().toString().substring(11, 19);
-    setState(() {
-      _logs.add('$t  $m');
-      if (_logs.length > 200) _logs.removeAt(0);
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_logScroll.hasClients) _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
-    });
+    _runLog.add('${DateTime.now().toString().substring(11, 19)}  $m'); // 기록 화면만 다시 그려진다
   }
 
   Future<void> _loginFailedDialog(LoginException e) => _dialog(
@@ -513,8 +574,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ));
   }
 
-  void _selectWhere(bool Function(Seat) test) {
-    setState(() => _selected = _seats.where((s) => s.active && test(s)).map((s) => s.code).toList());
+  void _selectAll() {
+    setState(() => _selected = _seats.where((s) => s.active).map((s) => s.code).toList());
     _saveSelection();
   }
 
@@ -573,11 +634,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _start() async {
     if (_phase != _Phase.idle) return; // 연타하거나 멈추는 중에 눌러도 한 번만 시작한다
-    if (_roomId == null || _room == null) {
+    // 좌석을 골랐으면 예약 루프를 돌린다. 안 골랐어도 자동 연장이 켜져 있으면 "이미 갖고 있는 좌석의 연장"만 한다.
+    final hunt = _selected.isNotEmpty;
+    if ((hunt || !_autoRenew) && (_roomId == null || _room == null)) {
       _toast('열람실을 먼저 선택해 주세요.');
       return;
     }
-    if (_selected.isEmpty) {
+    if (!hunt && !_autoRenew) {
       _toast('예약할 좌석을 하나 이상 선택해 주세요.');
       return;
     }
@@ -587,105 +650,251 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     final uid = _id.text.trim();
     final pw = _pw.text;
-    final roomId = _roomId!;
-    final roomName = _room!.name;
+    final roomId = _roomId;
+    final roomName = hunt ? _room!.name : '';
     final wanted = List<String>.of(_selected);
     final sec = double.tryParse(_interval.text.trim()) ?? 1.5;
     final interval = Duration(milliseconds: (sec.clamp(_minIntervalSec, 60) * 1000).round());
+    final renewPolicy = widget.services.renewPolicy;
 
+    _runStatus.value = null;
+    _renewStatus.value = null;
     setState(() {
       _phase = _Phase.starting;
-      _runStatus = null;
       _lastResult = null;
       _lastBeat = null;
       _lastNotif = null;
+      _lastServiceText = null;
     });
     final bg = widget.services.background;
-    RunOutcome outcome = const Crashed('예약을 시작하지 못했어요');
+    RunOutcome? huntOutcome; // 예약 루프가 끝난 이유
+    RenewOutcome? renewOutcome; // 자동 연장이 끝난 이유
+    var huntAnnounced = false; // 예약 결과(배정 완료)를 이미 알리고 연장을 이어 갔는지
+    var renewAnnounced = false; // 연장이 오류로 끝난 것을 이미 알렸는지
+    ReservationRunner? runner; // 예외가 나도 finally 에서 둘 다 멈출 수 있게 밖에 둔다
+    SeatRenewer? renewer;
+    Object? setupError;
     try {
       await _saveAccount();
       await _saveSelection();
       await bg.requestPermission();
-      final serviceUp = await bg.start(title: '좌석 예약 실행 중', text: '$roomName · ${wanted.length}개 좌석 감시 중');
+      final serviceUp = await bg.start(
+        title: hunt ? '좌석 예약 실행 중' : '자동 연장 실행 중',
+        text: hunt ? '$roomName · ${wanted.length}개 좌석 감시 중' : '내 좌석을 지켜보는 중',
+      );
       if (!serviceUp) {
         _log('백그라운드 실행을 시작하지 못했어요. 앱을 켜 둔 동안에만 확실히 동작해요.');
         _toast('백그라운드 실행을 시작하지 못했어요. 앱을 켜 둔 채로 사용해 주세요.');
       }
-      await RunMarker.begin(roomName, wanted.length);
-      _log('$roomName · 좌석 ${wanted.join(', ')} 감시 시작');
-      if (!_batteryOk) _log('배터리 제한이 켜져 있어요. 화면을 오래 끄면 멈출 수 있으니 고급 설정에서 풀어 주세요.');
-      final runner = ReservationRunner(
-        roomId: roomId,
-        wanted: wanted,
-        policy: widget.services.policyFor(interval),
-        api: _loggedIn ? _api : null,
-        login: () async {
-          final api = widget.services.newApi();
-          await api.login(uid, pw);
-          _api = api;
-          if (mounted) setState(() => _loggedIn = true);
-          return api;
-        },
-        onLog: _log,
-        onStatus: (s) => _onRunStatus(s, roomName),
-        isEnvironmentAlive: serviceUp ? bg.isAlive : null,
-        replaceExisting: true,
-        confirmReplace: _askReplace,
-      );
-      _runner = runner;
-      if (!mounted) runner.stop();
+      await RunMarker.begin(roomName, hunt ? wanted.length : 0);
+      if (hunt) _log('$roomName · 좌석 ${wanted.join(', ')} 감시 시작');
+      if (_autoRenew) {
+        _log('자동 연장 켜짐: 이용 종료 ${renewPolicy.threshold.inMinutes}분 전부터 연장하고, 안 되면 ${renewPolicy.retryAfter.inMinutes}분 뒤 다시 시도해요');
+      }
+      if (!_batteryOk) _log('배터리 제한이 켜져 있어요. 화면을 오래 끄면 멈출 수 있으니 메뉴에서 풀어 주세요.');
+      // 예약 루프와 연장 루프가 같은 로그인을 나눠 쓴다 (서로의 로그인을 끊지 않게).
+      final shared = SharedLogin(() async {
+        final api = widget.services.newApi();
+        await api.login(uid, pw);
+        _api = api;
+        if (mounted) setState(() => _loggedIn = true);
+        return api;
+      });
+      runner = !hunt
+          ? null
+          : ReservationRunner(
+              roomId: roomId!,
+              wanted: wanted,
+              policy: widget.services.policyFor(interval),
+              api: _loggedIn ? _api : null,
+              login: shared.call,
+              onLog: _log,
+              onStatus: (s) => _onRunStatus(s, roomName),
+              isEnvironmentAlive: serviceUp ? bg.isAlive : null,
+              replaceExisting: true,
+              confirmReplace: _askReplace,
+            );
+      renewer = !_autoRenew
+          ? null
+          : SeatRenewer(
+              policy: renewPolicy,
+              api: _loggedIn ? _api : null,
+              login: shared.call,
+              onLog: _log,
+              onStatus: _onRenewStatus,
+              onEvent: _onRenewEvent,
+              isEnvironmentAlive: serviceUp ? bg.isAlive : null,
+              waitForSeat: () => _runner != null, // 좌석을 노리는 예약 루프가 아직 돌면 좌석이 없어도 기다린다
+            );
+      final hunter = runner, watcher = renewer; // 아래 비동기 함수 안에서 null 이 아님을 쓰려고 한 번 더 받는다
+      _runner = hunter;
+      _renewer = watcher;
+      if (!mounted) {
+        hunter?.stop();
+        watcher?.stop();
+      }
       if (mounted) setState(() => _phase = _Phase.running);
-      outcome = await runner.run();
+      // 두 루프는 서로 독립이다. 어느 한쪽에서 예외가 나도 다른 쪽이 멈추지 않은 채 남지 않도록, 각자 오류를 결과로 바꿔 둔다.
+      await Future.wait([
+        if (hunter != null)
+          () async {
+            try {
+              final o = await hunter.run();
+              huntOutcome = o;
+              _runner = null;
+              if (mounted) setState(() {}); // 실행 배너가 "연장만 지켜보는 중"으로 바뀌도록
+              // 좌석을 갖게 됐거나 (좌석 바꾸기를 "아니요" 해서) 갖고 있는 좌석을 그대로 두기로 했으면, 자동 연장이 켜져 있는 한 끝내지 않고
+              // 연장을 이어 간다. 사용자가 직접 멈췄거나 실패한 경우는 연장도 같이 끝낸다.
+              final declined = o is Stopped && !hunter.isStopped;
+              if (watcher != null && (o is Reserved || o is KeepingSeat || declined)) {
+                huntAnnounced = true;
+                watcher.nudge(); // 좌석이 있으니 기다리지 말고 바로 확인한다
+                if (!declined && mounted) unawaited(_announceHunt(o, roomName));
+              } else {
+                watcher?.stop();
+              }
+            } catch (e) {
+              huntOutcome ??= Crashed(e);
+              _runner = null;
+              watcher?.stop();
+            }
+          }(),
+        if (watcher != null)
+          () async {
+            try {
+              final o = await watcher.run();
+              renewOutcome = o;
+              _renewer = null;
+              // 연장이 오류로 먼저 끝나도 예약 루프는 계속 돈다. 그럴 때는 바로 알린다 (그 밖의 이유는 예약 루프가 같이 알린다).
+              if (o.reason == RenewEndReason.crashed && _runner != null && mounted) {
+                renewAnnounced = true;
+                unawaited(_announceRenewEnd(o));
+              }
+            } catch (e) {
+              renewOutcome ??= RenewOutcome(RenewEndReason.crashed, message: '$e', error: e);
+              _renewer = null;
+            }
+          }(),
+      ]);
     } catch (e) {
-      outcome = Crashed(e);
+      setupError = e;
     } finally {
+      runner?.stop(); // 이미 끝났으면 아무 일도 없다
+      renewer?.stop();
       _runner = null;
+      _renewer = null;
       await RunMarker.end();
       await bg.stop();
     }
     if (!mounted) return;
-    await _finishRun(outcome, roomName);
+    final hunted = huntOutcome ?? (hunt || setupError != null ? Crashed(setupError ?? '예약을 시작하지 못했어요') : null);
+    await _finishRun(hunted, renewOutcome, roomName, huntAnnounced: huntAnnounced, renewAnnounced: renewAnnounced);
   }
 
   void _stop() {
     if (_phase != _Phase.running) return;
     setState(() => _phase = _Phase.stopping);
     _runner?.stop();
+    _renewer?.stop();
   }
 
-  /// 조회할 때마다 불린다: 화면 상태, 도면의 좌석 정보, 알림 문구, "살아 있음" 기록을 갱신한다.
+  /// "살아 있음" 기록을 남기는 간격과, 알림 문구를 고치는 최소 간격. 조회는 1~2초마다 오지만 이 정도면 충분하다.
+  static const _beatEvery = Duration(seconds: 60);
+
+  /// 좌석 상태가 그대로인지 (id, 사용 여부, 남은 시간). 그대로면 도면과 목록을 다시 만들지 않는다.
+  static bool _sameSeats(List<Seat> a, List<Seat> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      final x = a[i], y = b[i];
+      if (x.id != y.id || x.occupied != y.occupied || x.active != y.active || x.remainingTime != y.remainingTime) return false;
+    }
+    return true;
+  }
+
+  void _beat(DateTime now) {
+    if (_lastBeat != null && now.difference(_lastBeat!) < _beatEvery) return;
+    _lastBeat = now;
+    RunMarker.beat(at: now);
+  }
+
+  /// 포그라운드 서비스 알림 문구를 고친다. 문구가 바뀌었을 때만, [_beatEvery] 에 한 번 이하로 고친다.
+  void _setServiceText(String title, String text, DateTime now) {
+    if (_lastNotif != null && now.difference(_lastNotif!) < _beatEvery) return;
+    final key = '$title|$text';
+    if (key == _lastServiceText) return;
+    _lastNotif = now;
+    _lastServiceText = key;
+    widget.services.background.update(title: title, text: text);
+  }
+
+  /// 조회할 때마다 불린다. 실행 배너만 갱신하고, 도면과 목록은 좌석 상태가 바뀐 때만 다시 그린다.
   void _onRunStatus(RunStatus s, String roomName) {
     if (!mounted) return;
-    setState(() {
-      _runStatus = s;
-      if (s.seats.isNotEmpty) {
-        // 도면과 목록의 좌석 상태와 남은 시간도 매 조회마다 새로 고친다.
+    _runStatus.value = s;
+    if (s.seats.isNotEmpty && !_sameSeats(_seatsApi, s.seats)) {
+      setState(() {
         _seatsApi = s.seats;
         _seats = _sorted(s.seats);
-      }
-    });
-    final now = DateTime.now();
-    if (_lastBeat == null || now.difference(_lastBeat!) >= const Duration(seconds: 15)) {
-      _lastBeat = now;
-      RunMarker.beat(at: now);
+      });
     }
-    if (_lastNotif == null || now.difference(_lastNotif!) >= const Duration(seconds: 30)) {
-      _lastNotif = now;
-      final shaky = s.errorStreak > 0 ? ' · 서버 응답 불안정' : '';
-      widget.services.background.update(
-        title: '좌석 예약 실행 중',
-        text: '$roomName · 빈 좌석 ${s.free}개 · ${s.checks}회 확인 (${_hm(now)})$shaky',
-      );
+    final now = DateTime.now();
+    _beat(now);
+    final shaky = s.errorStreak > 0 ? ' · 서버 응답 불안정' : '';
+    final renew = _renewer != null ? ' · 자동 연장 켜짐' : '';
+    _setServiceText('좌석 예약 실행 중', '$roomName · 빈 좌석 ${s.free}개 (${_hm(now)})$shaky$renew', now);
+  }
+
+  /// 자동 연장이 내 좌석을 확인할 때마다 불린다.
+  void _onRenewStatus(RenewStatus s) {
+    if (!mounted) return;
+    _renewStatus.value = s;
+    final now = DateTime.now();
+    _beat(now);
+    // 예약 루프가 도는 동안은 거기서 알림 문구를 정한다. 연장만 지켜보는 중일 때만 여기서 정한다.
+    if (_runner != null) return;
+    final held = s.held;
+    final rem = held?.remainingMinutes;
+    final shaky = s.errorStreak > 0 ? ' · 서버 응답 불안정' : '';
+    _setServiceText(
+      '자동 연장 실행 중',
+      held == null
+          ? '좌석을 기다리는 중 (${_hm(now)})$shaky'
+          : '${held.seatCode}번 좌석${rem == null ? '' : ' · 남은 ${longRemaining(rem)}'} · 연장 ${s.renewed}번 (${_hm(now)})$shaky',
+      now,
+    );
+  }
+
+  /// 연장에 성공하거나 실패했을 때 알린다. 앱이 보이면 잠깐 뜨는 안내, 안 보이면 시스템 알림이다 (팝업으로 가로막지 않는다).
+  void _onRenewEvent(RenewEvent e) {
+    if (!mounted) return;
+    final where = e.seat.roomName.isEmpty ? '' : '${e.seat.roomName} ';
+    final String title, body;
+    if (e.kind == RenewEventKind.renewed) {
+      title = '연장했어요';
+      body = '$where${e.seat.seatCode}번 좌석을 연장했어요. (이번 실행 ${e.count}번째)';
+    } else {
+      if (e.failStreak != 1) return; // 실패가 이어져도 처음 한 번만 알린다 (다시 시도하는 건 기록에 남는다)
+      final retry = e.retryIn?.inMinutes ?? 5;
+      title = '연장하지 못했어요';
+      body = '$where${e.seat.seatCode}번 좌석: ${e.message}. $retry분 뒤에 다시 시도해요. 도서관 밖이라면 안으로 들어와 주세요.';
+    }
+    if (widget.services.desktop || !_inForeground) {
+      unawaited(widget.services.notifier.show(title: title, body: body));
+    } else {
+      _toast('$title $body');
     }
   }
 
-  /// 예약이 끝난 이유를 사용자에게 알린다. 앱이 보이면 팝업, 안 보이면 시스템 알림, 어느 쪽이든 화면 위에 안내를 남긴다.
-  Future<void> _finishRun(RunOutcome outcome, String roomName) async {
-    final _Notice? notice = switch (outcome) {
+  /// 예약 루프가 끝난 이유를 알릴 문구. [watching] 이면 좌석을 받은 뒤 자동 연장을 이어 가는 중이다.
+  _Notice? _huntNotice(RunOutcome outcome, String roomName, {bool watching = false}) {
+    final minutes = widget.services.renewPolicy.threshold.inMinutes;
+    return switch (outcome) {
       Reserved(:final seat) => _Notice(
           good: true,
           title: '배정 완료!',
-          body: '$roomName ${seat.code}번 좌석이 배정됐어요. 도서관 홈페이지에서 확인해 주세요.',
+          body: '$roomName ${seat.code}번 좌석이 배정됐어요. 도서관 홈페이지에서 확인해 주세요.'
+              '${watching ? ' 자동 연장이 켜져 있어서, 이 좌석을 계속 지켜보다가 이용 종료 $minutes분 전에 연장해요. 앱을 끄지만 않으면 돼요.' : ''}',
         ),
       Stopped() => null,
       LoginRejected() => const _Notice(
@@ -703,7 +912,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       KeepingSeat(:final held) => _Notice(
           good: true,
           title: '이미 가장 원하는 좌석이에요',
-          body: '${held.roomName} ${held.seatCode}번 좌석을 이미 갖고 있어요. 더 바꿀 좌석이 없어서 멈췄어요.',
+          body: watching
+              ? '${held.roomName} ${held.seatCode}번 좌석을 이미 갖고 있어요. 더 바꿀 좌석이 없어서 예약은 마치고, 자동 연장만 계속해요.'
+              : '${held.roomName} ${held.seatCode}번 좌석을 이미 갖고 있어요. 더 바꿀 좌석이 없어서 멈췄어요.',
         ),
       ReplaceFailed(:final wanted, :final old, :final restored, :final message) => _Notice(
           title: restored ? '${wanted.code}번으로 바꾸지 못했어요' : '좌석을 바꾸다 실패했어요',
@@ -720,23 +931,113 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
       Crashed(:final error) => _Notice(title: '오류로 예약이 멈췄어요', body: '$error'),
     };
-    if (outcome is Crashed) unawaited(CrashLog.record(outcome.error, null));
-    _log(notice?.title ?? '예약을 멈췄어요');
-    setState(() {
-      _phase = _Phase.idle;
-      _lastResult = notice;
-      if (outcome is LoginRejected) _loggedIn = false; // 다시 로그인하도록
-    });
-    if (notice == null) return;
+  }
+
+  /// 자동 연장이 끝난 이유를 알릴 문구. 사용자가 멈춘 것이면 null.
+  _Notice? _renewNotice(RenewOutcome o) {
+    final seat = o.lastSeat?.seatCode;
+    return switch (o.reason) {
+      RenewEndReason.stopped => null,
+      RenewEndReason.seatEnded => o.failing
+          ? _Notice(
+              title: '연장하지 못한 채 이용이 끝났어요',
+              body: '${seat ?? ''}번 좌석을 연장하지 못했어요. (${o.message}) 도서관 안에서 홈페이지로 직접 연장해 보거나, 좌석을 다시 예약해 주세요.',
+            )
+          : _Notice(
+              good: true,
+              title: '좌석 이용이 끝났어요',
+              body: '${seat ?? ''}번 좌석 이용이 끝나 자동 연장을 멈췄어요.${o.renewed > 0 ? ' 이번에 ${o.renewed}번 연장했어요.' : ''}',
+            ),
+      RenewEndReason.noSeat => const _Notice(
+          title: '연장할 좌석이 없어요',
+          body: '지금 갖고 있는 좌석이 없어서 자동 연장을 시작하지 않았어요. 좌석을 잡은 뒤 다시 시작해 주세요.',
+        ),
+      RenewEndReason.loginRejected => const _Notice(
+          title: '로그인에 실패해 자동 연장을 멈췄어요',
+          body: '학번 또는 비밀번호가 올바르지 않아요. 여러 번 틀리면 5분간 로그인이 막히니, 도서관 홈페이지에서 먼저 로그인해 보고 다시 시도해 주세요.',
+        ),
+      RenewEndReason.serverUnavailable => _Notice(
+          title: '서버가 응답하지 않아 자동 연장을 멈췄어요',
+          body: '${o.downFor?.inMinutes ?? 0}분 넘게 도서관 서버에 연결되지 않았어요. (${o.message}) 잠시 뒤 다시 시작해 주세요.',
+        ),
+      RenewEndReason.environmentLost => const _Notice(
+          title: '백그라운드 실행이 끝나 자동 연장을 멈췄어요',
+          body: '시스템이 서비스를 종료했어요. 앱을 열고 다시 시작해 주세요.',
+        ),
+      RenewEndReason.crashed => _Notice(title: '오류로 자동 연장이 멈췄어요', body: o.message),
+    };
+  }
+
+  /// 안내를 알린다. 컴퓨터에서는 창이 떠 있어도 다른 창에 가려 있거나 다른 일을 하는 중일 수 있어서 늘 시스템 알림으로 알린다.
+  /// 폰에서는 앱이 보일 때만 팝업, 안 보이면 알림이다. [loginRejectedMessage] 가 있으면 로그인 실패 전용 팝업을 쓴다.
+  Future<void> _tell(_Notice notice, {String? loginRejectedMessage}) async {
+    if (widget.services.desktop || !_inForeground) {
+      await widget.services.notifier.show(title: notice.title, body: notice.body);
+    }
     if (_inForeground) {
-      if (outcome is LoginRejected) {
-        await _loginFailedDialog(LoginException(outcome.message));
+      if (loginRejectedMessage != null) {
+        await _loginFailedDialog(LoginException(loginRejectedMessage));
       } else {
         await _dialog(notice.title, notice.body);
       }
-    } else {
-      await widget.services.notifier.show(title: notice.title, body: notice.body);
     }
+  }
+
+  /// 좌석을 받았는데 자동 연장이 켜져 있어 세션을 끝내지 않을 때, 예약 결과만 먼저 알린다.
+  Future<void> _announceHunt(RunOutcome outcome, String roomName) async {
+    final notice = _huntNotice(outcome, roomName, watching: true);
+    if (notice == null) return;
+    _log(notice.title);
+    try {
+      await _tell(notice);
+    } catch (e) {
+      debugPrint('안내를 알리지 못했어요: $e');
+    }
+  }
+
+  /// 예약 루프는 계속 도는데 자동 연장만 오류로 끝났을 때 바로 알린다.
+  Future<void> _announceRenewEnd(RenewOutcome o) async {
+    final notice = _renewNotice(o);
+    if (notice == null) return;
+    unawaited(CrashLog.record(o.error ?? o.message, null));
+    _log(notice.title);
+    try {
+      await _tell(notice);
+    } catch (e) {
+      debugPrint('안내를 알리지 못했어요: $e');
+    }
+  }
+
+  /// 끝난 이유를 사용자에게 알린다. 앱이 보이면 팝업, 안 보이면 시스템 알림, 어느 쪽이든 화면 위에 안내를 남긴다.
+  /// 좌석을 받은 뒤 연장을 이어 가다 끝난 경우([huntAnnounced])에는 연장이 끝난 이유를, 그 밖에는 예약 루프의 결과를 알린다.
+  Future<void> _finishRun(
+    RunOutcome? hunt,
+    RenewOutcome? renew,
+    String roomName, {
+    bool huntAnnounced = false,
+    bool renewAnnounced = false,
+  }) async {
+    _Notice? notice;
+    String? loginRejected; // 로그인이 거절돼 끝났으면 그 메시지
+    Object? crash; // 오류로 끝났으면 그 오류
+    if (hunt != null && !huntAnnounced) {
+      notice = _huntNotice(hunt, roomName);
+      if (hunt is LoginRejected) loginRejected = hunt.message;
+      if (hunt is Crashed) crash = hunt.error;
+    } else if (renew != null && !renewAnnounced) {
+      notice = _renewNotice(renew);
+      if (renew.reason == RenewEndReason.loginRejected) loginRejected = renew.message;
+      if (renew.reason == RenewEndReason.crashed) crash = renew.error ?? renew.message;
+    }
+    if (crash != null) unawaited(CrashLog.record(crash, null));
+    _log(notice?.title ?? (hunt == null || huntAnnounced ? '자동 연장을 멈췄어요' : '예약을 멈췄어요'));
+    setState(() {
+      _phase = _Phase.idle;
+      _lastResult = notice;
+      if (loginRejected != null) _loggedIn = false; // 다시 로그인하도록
+    });
+    if (notice == null) return;
+    await _tell(notice, loginRejectedMessage: loginRejected);
   }
 
   Future<void> _showCrashLog() async {
@@ -778,12 +1079,134 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _runner?.stop();
+    _renewer?.stop();
     _id.dispose();
     _pw.dispose();
     _interval.dispose();
     _range.dispose();
-    _logScroll.dispose();
+    _runStatus.dispose();
+    _renewStatus.dispose();
+    _runLog.dispose();
     super.dispose();
+  }
+
+  // ---------- 메뉴 ----------
+
+  /// 확인 간격을 고치는 창. 예약이 도는 동안에는 바꿀 수 없다.
+  Future<void> _editInterval() async {
+    Navigator.pop(context); // 메뉴를 닫는다
+    if (_running) {
+      _toast('예약이 도는 동안에는 바꿀 수 없어요. 멈춘 뒤에 바꿔 주세요.');
+      return;
+    }
+    final before = _interval.text;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('확인 간격(초)'),
+        content: TextField(
+          controller: _interval,
+          autofocus: true,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: InputDecoration(
+            helperText: '곧 비는 좌석이 있을 때의 간격이에요. 멀면 자동으로 늦춰요. 최소 ${_minIntervalSec.toInt()}초'.keepWords,
+            helperMaxLines: 3,
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('취소')),
+          TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('확인')),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    final value = double.tryParse(_interval.text.trim());
+    if (ok != true || value == null) {
+      if (ok == true) _toast('숫자로 입력해 주세요. 예: 1.5');
+      setState(() => _interval.text = before);
+      return;
+    }
+    setState(() => _interval.text = '${value.clamp(_minIntervalSec, 60)}'.replaceAll(RegExp(r'\.0$'), ''));
+    final p = await SharedPreferences.getInstance();
+    await p.setString('interval', _interval.text);
+  }
+
+  void _openLog() {
+    Navigator.pop(context); // 메뉴를 닫는다
+    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => RunLogPage(log: _runLog)));
+  }
+
+  /// 메인 화면에 둘 필요가 없는 것들 (기록, 설정, 업데이트, 배터리, 오류 기록).
+  Widget _menu() {
+    final scheme = Theme.of(context).colorScheme;
+    return Drawer(
+      backgroundColor: Colors.white,
+      surfaceTintColor: Colors.transparent,
+      child: SafeArea(
+        child: ListView(
+          padding: EdgeInsets.zero,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 24, 20, 16),
+              child: Row(children: [
+                CircleAvatar(
+                  radius: 20,
+                  backgroundColor: scheme.primary,
+                  child: const Icon(Icons.event_seat, size: 20, color: Colors.white),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('도서관 좌석 예약', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+                    if (_version.isNotEmpty)
+                      Text('버전 $_version', style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant)),
+                  ]),
+                ),
+              ]),
+            ),
+            const Divider(height: 1),
+            const SizedBox(height: 4),
+            ListTile(leading: const Icon(Icons.history), title: const Text('진행 기록'), onTap: _openLog),
+            ListTile(
+              leading: const Icon(Icons.timer_outlined),
+              title: const Text('확인 간격'),
+              subtitle: Text('${_interval.text.trim()}초'),
+              onTap: _editInterval,
+            ),
+            const Divider(height: 16, indent: 16, endIndent: 16),
+            if (!widget.services.desktop) // 배터리 제한은 폰에만 있다
+              ListTile(
+                leading: Icon(_batteryOk ? Icons.battery_charging_full : Icons.battery_alert),
+                title: const Text('배터리 제한'),
+                isThreeLine: !_batteryOk,
+                subtitle: Text(
+                    (_batteryOk ? '풀려 있어요' : '켜져 있으면 화면을 끈 채 오래 두었을 때 예약이 멈출 수 있어요').keepWords),
+                trailing: _batteryOk ? null : TextButton(onPressed: _requestBattery, child: const Text('제한 풀기')),
+              ),
+            ListTile(
+              leading: const Icon(Icons.system_update_alt),
+              title: Text(_checkingUpdate ? '확인하는 중…' : '업데이트 확인'),
+              subtitle: Text(_version.isEmpty ? '앱 버전' : '앱 버전 $_version'),
+              onTap: _checkingUpdate || _updating
+                  ? null
+                  : () {
+                      Navigator.pop(context);
+                      _checkUpdate(manual: true);
+                    },
+            ),
+            if (_crashes.isNotEmpty)
+              ListTile(
+                leading: const Icon(Icons.bug_report_outlined),
+                title: Text('오류 기록 ${_crashes.length}건'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showCrashLog();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   // ---------- 화면 ----------
@@ -792,91 +1215,122 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('도서관 좌석 예약', style: TextStyle(fontWeight: FontWeight.bold)),
-        backgroundColor: const Color(0xFFF4F5F9),
-        surfaceTintColor: Colors.transparent,
-      ),
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
-          children: [
-            if (_update != null)
-              UpdateBanner(
-                currentVersion: _version,
-                newVersion: _update!.version,
-                notes: _update!.notes,
-                progress: _updateProgress,
-                busy: _updating,
-                blocked: _running,
-                onUpdate: _installUpdate,
-              ),
-            if (_lastResult != null && !_running) _resultCard(_lastResult!),
-            if (_running) _runningBanner() else _intro(),
-            _loginStep(),
-            _roomStep(),
-            _seatStep(),
-            _startStep(),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _intro() {
-    final scheme = Theme.of(context).colorScheme;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(color: scheme.primaryContainer, borderRadius: BorderRadius.circular(14)),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(Icons.event_seat, color: scheme.onPrimaryContainer),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Text(
-            '원하는 좌석을 골라 두면, 그중 한 자리가 비는 순간 자동으로 예약해 줘요. 아래 순서대로 따라 해 보세요.'.keepWords,
-            style: TextStyle(color: scheme.onPrimaryContainer, height: 1.4),
+        leading: Builder(
+          builder: (c) => IconButton(
+            icon: const Icon(Icons.menu),
+            tooltip: '메뉴',
+            onPressed: () => Scaffold.of(c).openDrawer(),
           ),
         ),
-      ]),
+        title: const Text('도서관 좌석 예약'),
+      ),
+      drawer: _menu(),
+      body: SafeArea(
+        // 컴퓨터의 넓은 창에서도 폰 화면처럼 한 줄로 보이게 폭을 제한하고 가운데에 둔다.
+        child: Align(
+          alignment: Alignment.topCenter,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 640),
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+              children: [
+                if (_update != null)
+                  UpdateBanner(
+                    currentVersion: _version,
+                    newVersion: _update!.version,
+                    notes: _update!.notes,
+                    progress: _updateProgress,
+                    busy: _updating,
+                    blocked: _running && !widget.services.desktop,
+                    desktop: widget.services.desktop,
+                    onUpdate: _installUpdate,
+                  ),
+                if (_lastResult != null && !_running) _resultCard(_lastResult!),
+                if (_running) _runningBanner(),
+                _loginStep(),
+                _roomStep(),
+                _seatStep(),
+                _startStep(),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 
   Widget _runningBanner() {
     final scheme = Theme.of(context).colorScheme;
-    final fg = scheme.onTertiaryContainer;
-    final s = _runStatus;
-    final soonest = s?.soonest;
-    final title = switch (_phase) {
-      _Phase.starting => '예약을 시작하는 중이에요',
-      _Phase.stopping => '멈추는 중이에요',
-      _ => '빈 좌석을 찾는 중이에요',
-    };
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(color: scheme.tertiaryContainer, borderRadius: BorderRadius.circular(14)),
-      child: Row(children: [
-        const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5)),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title, style: TextStyle(fontWeight: FontWeight.bold, color: fg)),
-            Text(
-              s == null ? '첫 확인을 기다리는 중…' : '선택한 ${s.wanted}개 중 지금 빈 좌석 ${s.free}개 · ${s.checks}회 확인',
-              style: TextStyle(fontSize: 12.5, color: fg),
-            ),
-            if (s != null && s.errorStreak > 0)
-              Text('서버 응답이 불안정해요 (${s.errorStreak}번째 재시도). 자동으로 계속 시도해요.',
-                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: scheme.error)),
-            if (soonest != null)
-              Text('가장 빨리 비는 좌석: ${soonest.code}번 (이용 종료까지 ${longRemaining(soonest.remainingMinutes!)})',
-                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: fg)),
-            Text('홈 화면으로 나가도 계속 동작해요. 최근 앱 목록에서 밀어서 끄면 예약도 멈춰요.'.keepWords,
-                style: TextStyle(fontSize: 12, color: fg)),
-          ]),
-        ),
-      ]),
+    final fg = scheme.onPrimaryContainer;
+    return BannerCard(
+      color: scheme.primaryContainer,
+      leading: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.4, color: fg)),
+      // 조회마다 바뀌는 값은 여기만 다시 그린다 (화면 전체를 다시 그리지 않는다).
+      child: ListenableBuilder(
+        listenable: Listenable.merge([_runStatus, _renewStatus]),
+        builder: (context, _) {
+              final s = _runStatus.value;
+              final soonest = s?.soonest;
+              // 좌석을 받은 뒤 자동 연장만 이어 가는 중이면 예약 루프는 없다.
+              final watching = _runner == null && _renewer != null && _phase == _Phase.running;
+              final title = switch (_phase) {
+                _Phase.starting => '예약을 시작하는 중이에요',
+                _Phase.stopping => '멈추는 중이에요',
+                _ => watching ? '자동 연장을 지켜보는 중이에요' : '빈 좌석을 찾는 중이에요',
+              };
+              return Column(crossAxisAlignment: CrossAxisAlignment.start, spacing: 3, children: [
+                Text(title, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: fg)),
+                if (!watching)
+                  Text(
+                    s == null ? '첫 확인을 기다리는 중…' : '선택한 ${s.wanted}개 중 지금 빈 좌석 ${s.free}개 · ${s.checks}회 확인',
+                    style: TextStyle(fontSize: 12.5, color: fg),
+                  ),
+                if (!watching && s != null && s.errorStreak > 0)
+                  Text('서버 응답이 불안정해요 (${s.errorStreak}번째 재시도). 자동으로 계속 시도해요.',
+                      style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: scheme.error)),
+                if (!watching && soonest != null)
+                  Text('가장 빨리 비는 좌석: ${soonest.code}번 (이용 종료까지 ${longRemaining(soonest.remainingMinutes!)})',
+                      style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: fg)),
+                ..._renewLines(fg, scheme),
+                Text(
+                    (widget.services.desktop
+                            ? '창을 최소화하거나 가려도 계속 동작해요. 창을 닫으면 예약도 멈춰요.'
+                            : '홈 화면으로 나가도 계속 동작해요. 최근 앱 목록에서 밀어서 끄면 예약도 멈춰요.')
+                        .keepWords,
+                    style: TextStyle(fontSize: 12, height: 1.35, color: fg.withValues(alpha: 0.8))),
+              ]);
+        },
+      ),
     );
+  }
+
+  /// 실행 배너에 붙는 자동 연장 상태 (자동 연장이 켜져 있을 때만).
+  List<Widget> _renewLines(Color fg, ColorScheme scheme) {
+    if (_renewer == null) return const [];
+    final p = widget.services.renewPolicy;
+    final r = _renewStatus.value;
+    final held = r?.held;
+    final rem = held?.remainingMinutes;
+    final style = TextStyle(fontSize: 12.5, color: fg);
+    final String line;
+    if (r == null) {
+      line = '자동 연장: 내 좌석을 확인하는 중…';
+    } else if (held == null) {
+      line = '자동 연장: 연장할 좌석이 아직 없어요. 좌석이 생기면 지켜봐요.';
+    } else {
+      line = '자동 연장: ${held.seatCode}번 좌석${rem == null ? '' : ' · 이용 종료까지 ${longRemaining(rem)}'}'
+          ' (${_hm(r.checkedAt)} 확인). 종료 ${p.threshold.inMinutes}분 전부터 연장해요.';
+    }
+    return [
+      Text(line.keepWords, style: style),
+      if (r != null && r.renewed > 0) Text('이번 실행에서 ${r.renewed}번 연장했어요.', style: style),
+      if (r != null && r.failStreak > 0)
+        Text('연장에 실패했어요 (${r.lastFailure}). ${p.retryAfter.inMinutes}분마다 다시 시도해요.'.keepWords,
+            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: scheme.error)),
+      if (r != null && r.errorStreak > 0)
+        Text('서버 응답이 불안정해요 (${r.errorStreak}번째). 자동으로 계속 시도해요.',
+            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: scheme.error)),
+    ];
   }
 
   /// 마지막 결과 안내 (배정 완료, 중단 사유, 중간에 멈춤). 닫을 수 있다.
@@ -884,26 +1338,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final scheme = Theme.of(context).colorScheme;
     final bg = n.good ? const Color(0xFFE6F4E8) : scheme.errorContainer;
     final fg = n.good ? const Color(0xFF1B5E20) : scheme.onErrorContainer;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.fromLTRB(14, 12, 4, 12),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(14)),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(n.good ? Icons.check_circle : Icons.warning_amber_rounded, color: fg),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(n.title, style: TextStyle(fontWeight: FontWeight.bold, color: fg)),
-            const SizedBox(height: 2),
-            Text(n.body.keepWords, style: TextStyle(fontSize: 12.5, height: 1.4, color: fg)),
-          ]),
-        ),
-        IconButton(
-          tooltip: '닫기',
-          visualDensity: VisualDensity.compact,
-          onPressed: () => setState(() => _lastResult = null),
-          icon: Icon(Icons.close, size: 20, color: fg),
-        ),
+    return BannerCard(
+      color: bg,
+      leading: Icon(n.good ? Icons.check_circle : Icons.warning_amber_rounded, color: fg),
+      trailing: IconButton(
+        tooltip: '닫기',
+        visualDensity: VisualDensity.compact,
+        onPressed: () => setState(() => _lastResult = null),
+        icon: Icon(Icons.close, size: 20, color: fg),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, spacing: 3, children: [
+        Text(n.title, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: fg)),
+        Text(n.body.keepWords, style: TextStyle(fontSize: 12.5, height: 1.4, color: fg)),
       ]),
     );
   }
@@ -931,7 +1377,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           controller: _id,
           keyboardType: TextInputType.number,
           autofillHints: const [AutofillHints.username],
-          decoration: const InputDecoration(labelText: '학번', prefixIcon: Icon(Icons.person_outline), border: OutlineInputBorder()),
+          decoration: const InputDecoration(labelText: '학번', prefixIcon: Icon(Icons.person_outline)),
         ),
         const SizedBox(height: 10),
         TextField(
@@ -939,7 +1385,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           obscureText: true,
           autofillHints: const [AutofillHints.password],
           onSubmitted: (_) => _login(),
-          decoration: const InputDecoration(labelText: '비밀번호', prefixIcon: Icon(Icons.lock_outline), border: OutlineInputBorder()),
+          decoration: const InputDecoration(labelText: '비밀번호', prefixIcon: Icon(Icons.lock_outline)),
         ),
         CheckboxListTile(
           contentPadding: EdgeInsets.zero,
@@ -947,8 +1393,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           controlAffinity: ListTileControlAffinity.leading,
           value: _savePw,
           onChanged: (v) => setState(() => _savePw = v ?? true),
-          title: const Text('이 폰에 안전하게 저장 (다음부터 자동 입력)'),
-          subtitle: const Text('암호화되어 폰 안에만 보관돼요. 어디로도 전송되지 않아요.', style: TextStyle(fontSize: 11.5)),
+          title: Text(widget.services.desktop ? '이 컴퓨터에 안전하게 저장 (다음부터 자동 입력)' : '이 폰에 안전하게 저장 (다음부터 자동 입력)'),
+          subtitle: Text(widget.services.desktop ? '암호화되어 컴퓨터 안에만 보관돼요. 어디로도 전송되지 않아요.' : '암호화되어 폰 안에만 보관돼요. 어디로도 전송되지 않아요.',
+              style: const TextStyle(fontSize: 11.5)),
         ),
         const SizedBox(height: 4),
         FilledButton(
@@ -985,7 +1432,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return StepCard(
       step: 2,
       title: '열람실 선택',
-      subtitle: '예약할 열람실을 눌러 주세요',
       done: _room != null,
       trailing: IconButton(
         tooltip: '새로고침',
@@ -996,18 +1442,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  Widget _hint(String text) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Text(text, style: TextStyle(fontSize: 13.5, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+      );
+
   Widget _seatStep() {
     final room = _room;
     Widget body;
     if (room == null) {
-      body = const Text('먼저 위에서 열람실을 선택해 주세요.');
+      body = _hint('먼저 위에서 열람실을 선택해 주세요.');
     } else if (!_loggedIn) {
-      body = const Text('로그인하면 이 열람실의 좌석이 나타나요.');
+      body = _hint('로그인하면 이 열람실의 좌석이 나타나요.');
     } else if (_loadingSeats && _seats.isEmpty) {
       body = const Padding(padding: EdgeInsets.all(16), child: Center(child: CircularProgressIndicator()));
     } else if (_seats.isEmpty) {
       body = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('좌석을 아직 불러오지 못했어요.'),
+        _hint('좌석을 아직 불러오지 못했어요.'),
         TextButton.icon(onPressed: _loadSeats, icon: const Icon(Icons.refresh), label: const Text('다시 불러오기')),
       ]);
     } else {
@@ -1030,39 +1481,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           const SizedBox(height: 12),
         ],
         if (showMap) SeatMapLegend(layout: layout) else const SeatLegend(),
-        const SizedBox(height: 10),
-        Text(
-            (showMap
-                    ? '도면을 누르면 크게 열려요. 거기서 좌석을 눌러 고르세요. 사용 중인 좌석도 고를 수 있고, 비는 순간 바로 예약해요.'
-                    : '눌러서 고르세요. 사용 중인 좌석도 고를 수 있어요. 비는 순간 바로 예약해요.')
-                .keepWords,
-            style: TextStyle(fontSize: 12.5, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-        const SizedBox(height: 4),
-        Text('노란 숫자는 우선순위예요. 먼저 고른 좌석부터 예약해요.'.keepWords,
-            style: TextStyle(fontSize: 12.5, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-        if (_seats.any((s) => s.remainingMinutes != null)) ...[
-          const SizedBox(height: 4),
-          Text(
-              ('사용 중인 좌석 밑의 시간은 이용 종료까지 남은 시간이에요 (1:40 = 1시간 40분). '
-                      '${_running ? '예약이 실행되는 동안 자동으로 갱신돼요.' : '새로고침 버튼을 누르면 갱신돼요.'}')
-                  .keepWords,
-              style: TextStyle(fontSize: 12.5, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-        ],
         const SizedBox(height: 12),
         Wrap(spacing: 8, runSpacing: 4, children: [
           ActionChip(
             avatar: const Icon(Icons.done_all, size: 18),
             label: const Text('전체 선택'),
-            onPressed: _running ? null : () => _selectWhere((_) => true),
-          ),
-          ActionChip(
-            avatar: const Icon(Icons.event_seat, size: 18),
-            label: const Text('지금 빈 좌석만'),
-            onPressed: _running ? null : () => _selectWhere((s) => s.available),
+            visualDensity: VisualDensity.compact,
+            onPressed: _running ? null : _selectAll,
           ),
           ActionChip(
             avatar: const Icon(Icons.clear, size: 18),
             label: const Text('모두 해제'),
+            visualDensity: VisualDensity.compact,
             onPressed: _running ? null : _clearAll,
           ),
         ]),
@@ -1076,7 +1506,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 isDense: true,
                 labelText: '번호로 한 번에 선택',
                 hintText: '예: 25-40, 52',
-                border: OutlineInputBorder(),
               ),
               onSubmitted: (_) => _applyRange(),
             ),
@@ -1095,13 +1524,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
         ] else
           SeatGrid(seats: _seats, selected: _selected, onTap: _toggle),
-        if (_selected.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          Text('선택한 좌석 (우선순위 순)',
-              style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-          const SizedBox(height: 2),
-          Text(_selected.join(' → '), maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14)),
-        ],
       ]);
     }
     return StepCard(
@@ -1124,11 +1546,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _startStep() {
     final scheme = Theme.of(context).colorScheme;
+    final renew = widget.services.renewPolicy;
     return StepCard(
       step: 4,
       title: '예약 시작',
-      subtitle: '시작하면 화면이 꺼져도 계속 확인해요',
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        SwitchListTile(
+          contentPadding: const EdgeInsets.symmetric(horizontal: 14),
+          tileColor: kAppBg,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          secondary: Icon(Icons.autorenew, color: scheme.primary),
+          value: _autoRenew,
+          onChanged: _running ? null : _setAutoRenew,
+          title: const Text('자동 연장', style: TextStyle(fontWeight: FontWeight.w600)),
+          subtitle: Text('이용 종료 ${renew.threshold.inMinutes}분 전부터 연장해요. 안 되면 ${renew.retryAfter.inMinutes}분 뒤 다시 시도해요.'.keepWords,
+              style: TextStyle(fontSize: 12, height: 1.35, color: scheme.onSurfaceVariant)),
+        ),
+        const SizedBox(height: 12),
         SizedBox(
           height: 52,
           child: FilledButton.icon(
@@ -1148,80 +1582,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 _Phase.starting => '시작하는 중…',
                 _Phase.stopping => '멈추는 중…',
                 _Phase.running => '중지하기',
-                _Phase.idle => _selected.isEmpty ? '예약 시작' : '선택한 ${_selected.length}개 좌석 예약 시작',
+                _Phase.idle => _selected.isEmpty ? (_autoRenew ? '자동 연장만 시작' : '예약 시작') : '선택한 ${_selected.length}개 좌석 예약 시작',
               },
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
           ),
-        ),
-        ExpansionTile(
-          tilePadding: EdgeInsets.zero,
-          shape: const Border(),
-          collapsedShape: const Border(),
-          title: const Text('고급 설정', style: TextStyle(fontSize: 14)),
-          children: [
-            TextField(
-              controller: _interval,
-              enabled: !_running,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(
-                labelText: '확인 간격(초)',
-                helperText: '곧 비는 좌석이 있을 때의 간격이에요 (멀면 자동으로 늦춰요). 최소 1초',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(children: [
-              Expanded(
-                child: Text(_version.isEmpty ? '앱 버전' : '앱 버전 $_version',
-                    style: TextStyle(fontSize: 13, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-              ),
-              TextButton(
-                onPressed: _checkingUpdate || _updating ? null : () => _checkUpdate(manual: true),
-                child: Text(_checkingUpdate ? '확인하는 중…' : '업데이트 확인'),
-              ),
-            ]),
-            Row(children: [
-              Expanded(
-                child: Text(
-                    (_batteryOk
-                            ? '배터리 제한이 풀려 있어요.'
-                            : '배터리 제한이 켜져 있으면 화면을 끈 채 오래 두었을 때 예약이 멈출 수 있어요.')
-                        .keepWords,
-                    style: TextStyle(fontSize: 12.5, height: 1.4, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-              ),
-              if (!_batteryOk) TextButton(onPressed: _requestBattery, child: const Text('제한 풀기')),
-            ]),
-            if (_crashes.isNotEmpty)
-              Row(children: [
-                Expanded(
-                  child: Text('오류 기록 ${_crashes.length}건',
-                      style: TextStyle(fontSize: 13, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-                ),
-                TextButton(onPressed: _showCrashLog, child: const Text('보기')),
-              ]),
-          ],
-        ),
-        ExpansionTile(
-          tilePadding: EdgeInsets.zero,
-          shape: const Border(),
-          collapsedShape: const Border(),
-          title: Text('진행 기록 (${_logs.length})', style: const TextStyle(fontSize: 14)),
-          children: [
-            Container(
-              height: 180,
-              width: double.infinity,
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(color: const Color(0xFFF1F1F4), borderRadius: BorderRadius.circular(8)),
-              child: _logs.isEmpty
-                  ? const Center(child: Text('아직 기록이 없어요.'))
-                  : ListView.builder(
-                      controller: _logScroll,
-                      itemCount: _logs.length,
-                      itemBuilder: (_, i) => Text(_logs[i], style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
-                    ),
-            ),
-          ],
         ),
       ]),
     );

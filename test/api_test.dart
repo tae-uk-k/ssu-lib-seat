@@ -190,6 +190,109 @@ void main() {
     });
   });
 
+  group('연장', () {
+    // 실서버 응답에서 확인한 필드(remainingTime 은 분)에 홈페이지가 연장 전에 쓰는 isRenewable, arrivalConfirmMethods 를 더했다.
+    Map<String, dynamic> charge(Map<String, dynamic> extra) => {
+          'id': 900,
+          'seat': {'id': 118, 'code': '18'},
+          'room': {'id': 53, 'name': '숭실스퀘어ON(2F)'},
+          'isReturnable': true,
+          ...extra,
+        };
+
+    test('내 좌석에서 남은 시간, 연장 가능 여부, 도착 확인 방법을 읽는다', () async {
+      final api = _api((_) => _json({
+            'success': true,
+            'data': {
+              'list': [
+                charge({'remainingTime': 228, 'isRenewable': true, 'arrivalConfirmMethods': ['GATE', 'GPS']}),
+              ]
+            }
+          }));
+      final c = (await api.myCharges()).single;
+      expect(c.remainingMinutes, 228);
+      expect(c.renewable, isTrue);
+      expect(c.arrivalMethods, ['GATE', 'GPS']);
+    });
+
+    test('서버가 안 알려 주는 값은 비어 있다 (남은 시간 null, 연장 가능 여부 null, 방법 없음)', () async {
+      final api = _api((_) => _json({'success': true, 'data': {'list': [charge({})]}}));
+      final c = (await api.myCharges()).single;
+      expect(c.remainingMinutes, isNull);
+      expect(c.renewable, isNull);
+      expect(c.arrivalMethods, isEmpty);
+      final no = _api((_) => _json({'success': true, 'data': {'list': [charge({'isRenewable': false})]}}));
+      expect((await no.myCharges()).single.renewable, isFalse);
+    });
+
+    test('연장은 홈페이지와 같은 주소로 예약 번호를 POST 하고 응답을 그대로 돌려준다', () async {
+      RequestOptions? seen;
+      final api = _api((o) {
+        seen = o;
+        return _json({'success': true});
+      });
+      final res = await api.renewCharge(900);
+      expect(seen!.method, 'POST');
+      expect(seen!.path, endsWith('/1/api/seat-renewed-charges'));
+      expect(seen!.data, {'seatCharge': 900, 'smufMethodCode': 'PC'});
+      expect(res['success'], isTrue);
+      final no = await _api((_) => _json({'success': false, 'code': 'error.x', 'message': '도서관 밖입니다'})).renewCharge(900);
+      expect(no['success'], isFalse);
+      expect(no['message'], '도서관 밖입니다');
+    });
+
+    test('연장에만 쓰는 값이 이상한 모양이어도 내 좌석 목록은 읽힌다 (예약과 연장이 막히지 않게)', () async {
+      final api = _api((_) => _json({
+            'success': true,
+            'data': {
+              'list': [
+                charge({'remainingTime': '45', 'isRenewable': 'yes', 'arrivalConfirmMethods': 'GATE'}),
+                charge({'id': 901, 'remainingTime': 'soon', 'arrivalConfirmMethods': [1, 'GATE']}),
+                charge({'id': 902, 'remainingTime': null, 'isRenewable': null, 'arrivalConfirmMethods': null}),
+              ]
+            }
+          }));
+      final list = await api.myCharges();
+      expect(list, hasLength(3));
+      expect(list[0].remainingMinutes, 45); // 문자열 숫자는 숫자로
+      expect(list[0].renewable, isNull); // bool 이 아니면 모름
+      expect(list[0].arrivalMethods, isEmpty); // 목록이 아니면 없음
+      expect(list[1].remainingMinutes, isNull);
+      expect(list[1].arrivalMethods, ['1', 'GATE']);
+      expect(list[2].remainingMinutes, isNull);
+      expect(list[2].arrivalMethods, isEmpty);
+    });
+
+    test('연장 요청이 로그인 필요로 거절되면 SessionException, 서버 오류는 ApiException', () async {
+      await expectLater(
+          _api((_) => _json({'success': false, 'code': 'error.authentication.needLogin', 'message': '로그인 필요'})).renewCharge(900),
+          throwsA(isA<SessionException>()));
+      await expectLater(_api((_) => _json({'success': false}, 503)).renewCharge(900), throwsA(isA<ApiException>()));
+      await expectLater(_api((_) => _html()).renewCharge(900), throwsA(isA<ApiException>()));
+    });
+
+    test('도착 확인은 방 번호 주소로 방법 하나를 POST 하고, data 가 true 일 때만 확인된 것이다', () async {
+      RequestOptions? seen;
+      final api = _api((o) {
+        seen = o;
+        return _json({'success': true, 'data': true});
+      });
+      expect(await api.checkArrival(53, 'GATE'), isTrue);
+      expect(seen!.method, 'POST');
+      expect(seen!.path, endsWith('/1/api/rooms/53/check-arrival'));
+      expect(seen!.data, {'methodCode': 'GATE'});
+      expect(await _api((_) => _json({'success': true, 'data': false})).checkArrival(53, 'GATE'), isFalse);
+      expect(await _api((_) => _json({'success': false, 'code': 'error.x', 'data': true})).checkArrival(53, 'GATE'), isFalse);
+      expect(await _api((_) => _json({'success': true})).checkArrival(53, 'GATE'), isFalse);
+    });
+
+    test('도착 확인이 로그인 필요로 거절되면 SessionException', () async {
+      await expectLater(
+          _api((_) => _json({'success': false, 'code': 'error.authentication.needLogin'})).checkArrival(53, 'GATE'),
+          throwsA(isA<SessionException>()));
+    });
+  });
+
   test('예약 요청 응답은 그대로 돌려준다 (성공/실패 판단은 호출한 쪽)', () async {
     final ok = await _api((_) => _json({'success': true, 'data': {'id': 9}})).reserve(5);
     expect(ok['success'], isTrue);

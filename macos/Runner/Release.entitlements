@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- 도서관 서버와 GitHub(업데이트 확인)에 접속하려면 필요하다. 샌드박스 앱은 이게 없으면 인터넷을 쓸 수 없다. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

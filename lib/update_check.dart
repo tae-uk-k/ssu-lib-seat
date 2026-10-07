@@ -25,6 +25,7 @@ class UpdateInfo {
     required this.apkSize,
     required this.sha256,
     required this.notes,
+    this.pageUrl = '',
   });
 
   /// "1.0.3" (태그의 v 는 뗀 값)
@@ -36,6 +37,9 @@ class UpdateInfo {
   /// GitHub 가 계산해 준 파일 해시(소문자 16진수). 없으면 null.
   final String? sha256;
   final String notes;
+
+  /// 이 릴리스의 웹 페이지 주소. 컴퓨터(Windows/macOS)용 앱은 APK 를 설치할 수 없어서, 이 페이지에서 내려받게 한다.
+  final String pageUrl;
 }
 
 /// "v1.0.12", "1.0.12+3" → [1, 0, 12]. 숫자가 아닌 조각을 만나면 거기서 멈춘다.
@@ -79,6 +83,7 @@ UpdateInfo? parseRelease(Map<String, dynamic> j) {
       apkSize: (a['size'] as num?)?.toInt() ?? 0,
       sha256: digest is String && digest.startsWith('sha256:') ? digest.substring(7).toLowerCase() : null,
       notes: ((j['body'] as String?) ?? '').trim(),
+      pageUrl: (j['html_url'] as String?) ?? '',
     );
   }
   return null;

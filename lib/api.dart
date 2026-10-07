@@ -147,6 +147,9 @@ class MyCharge {
     required this.roomId,
     required this.roomName,
     required this.returnable,
+    this.remainingMinutes,
+    this.renewable,
+    this.arrivalMethods = const [],
   });
 
   /// 예약(배정) 번호. 취소할 때 쓴다. 좌석 번호가 아니다.
@@ -159,9 +162,23 @@ class MyCharge {
   /// true 면 이미 확정돼 이용 중이라 "취소"가 아니라 "반납"으로 내놓아야 한다 (홈페이지도 이때 취소 버튼을 숨기고 반납 버튼을 보여 준다).
   final bool returnable;
 
+  /// 이용 종료까지 남은 시간(분). 서버가 알려 주지 않으면 null. (실서버 값으로 분 단위를 확인함: 18:21~22:21 좌석이 18:33 에 228)
+  final int? remainingMinutes;
+
+  /// 서버가 "지금 연장할 수 있다"고 알려 준 값 (홈페이지에서 연장 버튼이 보이는 조건). 값이 없으면 null.
+  final bool? renewable;
+
+  /// 도서관에 와 있는지 확인하는 방법들 (AUTO, GATE, BEACON, GPS, RF_TAG). 홈페이지는 연장 전에 이 확인을 한다.
+  final List<String> arrivalMethods;
+
+  /// 좌석 번호처럼 꼭 필요한 값(id, seat)은 모양이 다르면 오류로 두고, 연장에만 쓰는 값(남은 시간, 연장 가능 여부, 도착 확인 방법)은
+  /// 서버가 다른 모양으로 줘도 목록 전체가 못 쓰게 되지 않도록 모르는 값(null, 빈 목록)으로 읽는다.
   factory MyCharge.fromJson(Map<String, dynamic> j) {
     final seat = j['seat'] as Map<String, dynamic>;
     final room = (j['room'] as Map?) ?? const {};
+    final renewable = j['isRenewable'];
+    final remaining = j['remainingTime'];
+    final methods = j['arrivalConfirmMethods'];
     return MyCharge(
       id: j['id'] as int,
       seatId: seat['id'] as int,
@@ -169,6 +186,9 @@ class MyCharge {
       roomId: room['id'] as int?,
       roomName: '${room['name'] ?? ''}',
       returnable: j['isReturnable'] == true,
+      remainingMinutes: remaining is num ? remaining.toInt() : (remaining is String ? int.tryParse(remaining) : null),
+      renewable: renewable is bool ? renewable : null,
+      arrivalMethods: methods is List ? [for (final m in methods) '$m'] : const [],
     );
   }
 }
@@ -191,6 +211,14 @@ abstract interface class LibraryApi {
 
   /// 이미 확정돼 이용 중인 좌석을 반납한다 ([MyCharge.id], [MyCharge.returnable] 이 true 인 좌석). 응답은 [cancelCharge] 와 같다.
   Future<Map<String, dynamic>> returnCharge(int chargeId);
+
+  /// 내가 이용 중인 좌석을 연장한다 ([MyCharge.id]). 응답은 [cancelCharge] 와 같다 (`success` 가 true 여야 연장된 것).
+  /// 도서관 밖이거나 연장할 수 없을 때는 `success: false` 로 이유가 온다. 로그인이 풀렸으면 [SessionException].
+  Future<Map<String, dynamic>> renewCharge(int chargeId);
+
+  /// 도서관 안에 와 있는지 서버에 확인한다 ([method] 는 [MyCharge.arrivalMethods] 중 하나, 이 앱은 GATE 만 한다).
+  /// 홈페이지도 연장하기 전에 이 확인을 한다. 확인되면 true. 로그인이 풀렸으면 [SessionException].
+  Future<bool> checkArrival(int roomId, String method);
 }
 
 class LibApi implements LibraryApi {
@@ -315,5 +343,27 @@ class LibApi implements LibraryApi {
       'smufMethodCode': 'PC',
     });
     return _json(r);
+  }
+
+  /// 로그인이 풀렸다는 응답이면 [SessionException] (홈페이지가 "로그인 필요"로 보는 코드).
+  Map<String, dynamic> _needLoginCheck(Map<String, dynamic> j) {
+    if (j['code'] == 'error.authentication.needLogin') throw SessionException('${j['code']} ${j['message']}');
+    return j;
+  }
+
+  @override
+  Future<Map<String, dynamic>> renewCharge(int chargeId) async {
+    final r = await _dio.post('/$_homepageId/api/seat-renewed-charges', data: {
+      'seatCharge': chargeId,
+      'smufMethodCode': 'PC',
+    });
+    return _needLoginCheck(_json(r));
+  }
+
+  @override
+  Future<bool> checkArrival(int roomId, String method) async {
+    final r = await _dio.post('/$_homepageId/api/rooms/$roomId/check-arrival', data: {'methodCode': method});
+    final j = _needLoginCheck(_json(r));
+    return j['success'] == true && j['data'] == true;
   }
 }

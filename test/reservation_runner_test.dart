@@ -84,6 +84,11 @@ class FakeApi implements LibraryApi {
   Future<Map<String, dynamic>> returnCharge(int chargeId) => _release('return', chargeId);
 
   @override
+  Future<Map<String, dynamic>> renewCharge(int chargeId) async => {'success': true};
+  @override
+  Future<bool> checkArrival(int roomId, String method) async => true;
+
+  @override
   Future<void> login(String uid, String pw) async {}
   @override
   Future<List<Room>> rooms() async => const [];

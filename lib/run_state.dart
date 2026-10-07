@@ -80,6 +80,21 @@ class RunMarker {
   }
 }
 
+/// 진행 기록. 줄이 늘어도 메인 화면은 다시 그리지 않고, 기록 화면만 [ChangeNotifier] 로 갱신한다.
+class RunLog extends ChangeNotifier {
+  static const maxLines = 200;
+  final _lines = <String>[];
+
+  int get length => _lines.length;
+  String operator [](int i) => _lines[i];
+
+  void add(String line) {
+    _lines.add(line);
+    if (_lines.length > maxLines) _lines.removeAt(0);
+    notifyListeners();
+  }
+}
+
 /// 잡히지 않은 오류의 최근 기록. 폰에서 문제가 생겼을 때 사용자가 복사해서 보내 줄 수 있게 한다.
 class CrashLog {
   static const _key = 'crash_log';

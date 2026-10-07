@@ -1,3 +1,5 @@
+import 'dart:io' show File, Platform;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -36,6 +38,47 @@ abstract class BackgroundService {
 abstract class ResultNotifier {
   Future<void> init();
   Future<void> show({required String title, required String body});
+}
+
+/// 컴퓨터(Windows/macOS)용. 컴퓨터에는 안드로이드 같은 "백그라운드 서비스"가 없고 앱 창이 떠 있는 동안 계속 돌기 때문에,
+/// 할 일은 예약하는 동안 컴퓨터가 잠자기에 들어가지 않게 붙잡아 두는 것뿐이다.
+class DesktopBackgroundService implements BackgroundService {
+  @override
+  Future<void> init() async {}
+
+  @override
+  Future<void> requestPermission() async {}
+
+  @override
+  Future<bool> start({required String title, required String text}) async {
+    try {
+      await WakelockPlus.enable();
+    } catch (e) {
+      debugPrint('잠자기 방지 실패: $e'); // 예약 자체는 계속 돌 수 있다
+    }
+    return true;
+  }
+
+  @override
+  Future<void> update({required String title, required String text}) async {}
+
+  @override
+  Future<void> stop() async {
+    try {
+      await WakelockPlus.disable();
+    } catch (e) {
+      debugPrint('잠자기 방지 해제 실패: $e');
+    }
+  }
+
+  @override
+  Future<bool> isAlive() async => true; // 앱이 떠 있는 동안은 항상 살아 있다
+
+  @override
+  Future<bool> isBatteryUnrestricted() async => true; // 배터리 최적화는 폰에만 있다
+
+  @override
+  Future<bool> requestBatteryUnrestricted() async => true;
 }
 
 class AndroidBackgroundService implements BackgroundService {
@@ -118,6 +161,7 @@ class AndroidBackgroundService implements BackgroundService {
 
   @override
   Future<void> stop() async {
+    _aliveAt = null;
     try {
       await FlutterForegroundTask.stopService();
     } catch (e) {
@@ -130,10 +174,20 @@ class AndroidBackgroundService implements BackgroundService {
     }
   }
 
+  DateTime? _aliveAt; // 마지막으로 "살아 있음"을 확인한 시각
+
+  /// 예약 루프가 조회할 때마다(1~2초) 부르므로, 살아 있다고 확인된 뒤 [_aliveCacheFor] 동안은 플랫폼에 다시 묻지 않는다.
+  /// 서비스가 끝난 것은 최대 그만큼 늦게 알아챌 뿐이고, 끝났다는 답은 기억하지 않는다.
+  static const _aliveCacheFor = Duration(seconds: 10);
+
   @override
   Future<bool> isAlive() async {
+    final at = _aliveAt;
+    if (at != null && DateTime.now().difference(at) < _aliveCacheFor) return true;
     try {
-      return await FlutterForegroundTask.isRunningService;
+      final alive = await FlutterForegroundTask.isRunningService;
+      _aliveAt = alive ? DateTime.now() : null;
+      return alive;
     } catch (_) {
       return true;
     }
@@ -170,11 +224,33 @@ class LocalResultNotifier implements ResultNotifier {
   final _plugin = FlutterLocalNotificationsPlugin();
   bool _ready = false;
 
+  /// Windows 알림에 붙일 앱 아이콘 파일. 프로그램 옆 data 폴더에 들어 있는 에셋을 가리킨다 (없으면 아이콘 없이 알린다).
+  static String? _windowsIconPath() {
+    if (!Platform.isWindows) return null;
+    try {
+      final dir = File(Platform.resolvedExecutable).parent.path;
+      final p = '$dir\\data\\flutter_assets\\assets\\icon\\toast_icon.png';
+      return File(p).existsSync() ? p : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   @override
   Future<void> init() async {
     try {
       await _plugin.initialize(
-        settings: const InitializationSettings(android: AndroidInitializationSettings('ic_stat_notify')),
+        // 플랫폼마다 자기 설정만 읽는다: 안드로이드는 상태바 아이콘, macOS 는 알림 권한 요청, Windows 는 알림에 붙는 앱 이름·아이콘과 고유 번호.
+        settings: InitializationSettings(
+          android: const AndroidInitializationSettings('ic_stat_notify'),
+          macOS: const DarwinInitializationSettings(),
+          windows: WindowsInitializationSettings(
+            appName: '도서관 좌석 예약',
+            appUserModelId: 'kr.ssu.libseat.LibSeat',
+            guid: '5d0f2c1e-8a47-4b6e-9c13-7e2b4a90d6f1',
+            iconPath: _windowsIconPath(),
+          ),
+        ),
       );
       _ready = true;
     } catch (e) {
@@ -199,6 +275,8 @@ class LocalResultNotifier implements ResultNotifier {
             priority: Priority.high,
             styleInformation: BigTextStyleInformation(body),
           ),
+          macOS: const DarwinNotificationDetails(presentAlert: true, presentSound: true),
+          windows: const WindowsNotificationDetails(),
         ),
       );
     } catch (e) {
