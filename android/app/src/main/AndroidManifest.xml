@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- 시간 제한이 없는 서비스 타입. dataSync 는 안드로이드 15 부터 6시간 뒤에 시스템이 끊는다. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 배터리 최적화에서 제외해 달라고 시스템 확인 창으로 요청한다. 화면을 꺼 두면 폰이 앱의 네트워크를 막아 예약이 끊기기 때문이다. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 앱 안 업데이트: 내려받은 APK 의 설치 창을 열려면 필요하다 (사용자가 "이 출처 허용"을 켜야 실제로 설치된다). -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- open_filex 플러그인이 끼워 넣는 저장소/미디어 읽기 권한. 앱 캐시 폴더의 APK 만 열므로 필요 없다. -->

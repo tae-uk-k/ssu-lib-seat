@@ -138,6 +138,41 @@ class Seat {
       );
 }
 
+/// 내가 지금 갖고 있는 좌석 (배정을 받았거나 이용 중). 홈페이지 "내 좌석" 목록의 한 줄이다.
+class MyCharge {
+  MyCharge({
+    required this.id,
+    required this.seatId,
+    required this.seatCode,
+    required this.roomId,
+    required this.roomName,
+    required this.returnable,
+  });
+
+  /// 예약(배정) 번호. 취소할 때 쓴다. 좌석 번호가 아니다.
+  final int id;
+  final int seatId;
+  final String seatCode;
+  final int? roomId;
+  final String roomName;
+
+  /// true 면 이미 확정돼 이용 중이라 "취소"가 아니라 "반납"으로 내놓아야 한다 (홈페이지도 이때 취소 버튼을 숨기고 반납 버튼을 보여 준다).
+  final bool returnable;
+
+  factory MyCharge.fromJson(Map<String, dynamic> j) {
+    final seat = j['seat'] as Map<String, dynamic>;
+    final room = (j['room'] as Map?) ?? const {};
+    return MyCharge(
+      id: j['id'] as int,
+      seatId: seat['id'] as int,
+      seatCode: '${seat['code']}',
+      roomId: room['id'] as int?,
+      roomName: '${room['name'] ?? ''}',
+      returnable: j['isReturnable'] == true,
+    );
+  }
+}
+
 /// 도서관 서버에 하는 요청. 예약 루프와 화면은 이 인터페이스만 쓰므로 시험에서 가짜로 바꿀 수 있다.
 abstract interface class LibraryApi {
   /// 로그인한다. 학번/비밀번호가 거절되면 [LoginException], 서버가 일시적으로 이상하면 [ApiException].
@@ -147,6 +182,15 @@ abstract interface class LibraryApi {
   /// 로그인이 풀렸거나 서버가 거부하면 [SessionException].
   Future<List<Seat>> seats(int roomId);
   Future<Map<String, dynamic>> reserve(int seatId);
+
+  /// 내가 지금 갖고 있는 좌석. 없으면 빈 목록. 로그인이 풀렸으면 [SessionException].
+  Future<List<MyCharge>> myCharges();
+
+  /// 배정만 받고 아직 확정 전인 좌석을 취소한다 ([MyCharge.id]). 서버 응답 그대로 돌려준다 (`success` 가 true 여야 취소된 것).
+  Future<Map<String, dynamic>> cancelCharge(int chargeId);
+
+  /// 이미 확정돼 이용 중인 좌석을 반납한다 ([MyCharge.id], [MyCharge.returnable] 이 true 인 좌석). 응답은 [cancelCharge] 와 같다.
+  Future<Map<String, dynamic>> returnCharge(int chargeId);
 }
 
 class LibApi implements LibraryApi {
@@ -240,6 +284,34 @@ class LibApi implements LibraryApi {
   Future<Map<String, dynamic>> reserve(int seatId) async {
     final r = await _dio.post('/$_homepageId/api/seat-charges', data: {
       'seatId': seatId,
+      'smufMethodCode': 'PC',
+    });
+    return _json(r);
+  }
+
+  @override
+  Future<List<MyCharge>> myCharges() async {
+    final r = await _dio.get('/$_homepageId/api/seat-charges');
+    final j = _json(r);
+    // 홈페이지도 "기록 없음"을 빈 목록으로 본다.
+    if (j['code'] == 'success.noRecord') return const [];
+    if (j['success'] != true) throw SessionException('${j['code']} ${j['message']}');
+    return _shape(() {
+      final list = ((j['data'] as Map?)?['list'] as List?) ?? const [];
+      return list.map((e) => MyCharge.fromJson(e as Map<String, dynamic>)).toList();
+    });
+  }
+
+  @override
+  Future<Map<String, dynamic>> cancelCharge(int chargeId) async {
+    final r = await _dio.delete('/$_homepageId/api/seat-charges/$chargeId', queryParameters: {'smufMethodCode': 'PC'});
+    return _json(r);
+  }
+
+  @override
+  Future<Map<String, dynamic>> returnCharge(int chargeId) async {
+    final r = await _dio.post('/$_homepageId/api/seat-discharges', data: {
+      'seatCharge': chargeId,
       'smufMethodCode': 'PC',
     });
     return _json(r);

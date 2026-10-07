@@ -23,15 +23,25 @@ import 'package:shared_preferences/shared_preferences.dart';
 SeatLayout? _layout53;
 
 class FakeLibrary implements LibraryApi {
-  FakeLibrary({List<List<Seat>>? script, this.loginError, this.reserveResult = const {'success': true}})
-      : script = script ?? [_seats()];
+  FakeLibrary({
+    List<List<Seat>>? script,
+    this.loginError,
+    this.reserveResult = const {'success': true},
+    this.held = const [],
+  }) : script = script ?? [_seats()];
 
   /// 조회할 때마다 차례로 돌려준다 (끝나면 마지막 것을 반복).
   final List<List<Seat>> script;
   final Exception? loginError;
   final Map<String, dynamic> reserveResult;
-  int logins = 0, seatCalls = 0, reserveCalls = 0;
+
+  /// 내가 이미 갖고 있는 좌석 (비어 있으면 없음). 취소하면 사라진다.
+  final List<MyCharge> held;
+  int logins = 0, seatCalls = 0, reserveCalls = 0, heldCalls = 0;
   final reservedIds = <int>[];
+
+  /// 상태를 바꾼 요청의 순서 ('cancel:예약번호', 'return:예약번호', 'reserve:좌석id').
+  final calls = <String>[];
 
   @override
   Future<void> login(String uid, String pw) async {
@@ -51,7 +61,28 @@ class FakeLibrary implements LibraryApi {
   Future<Map<String, dynamic>> reserve(int seatId) async {
     reserveCalls++;
     reservedIds.add(seatId);
+    calls.add('reserve:$seatId');
     return reserveResult;
+  }
+
+  @override
+  Future<List<MyCharge>> myCharges() async {
+    heldCalls++;
+    return List.of(held);
+  }
+
+  @override
+  Future<Map<String, dynamic>> cancelCharge(int chargeId) async {
+    calls.add('cancel:$chargeId');
+    held.removeWhere((c) => c.id == chargeId);
+    return {'success': true};
+  }
+
+  @override
+  Future<Map<String, dynamic>> returnCharge(int chargeId) async {
+    calls.add('return:$chargeId');
+    held.removeWhere((c) => c.id == chargeId);
+    return {'success': true};
   }
 }
 
@@ -69,8 +100,14 @@ List<Seat> _seats({Set<int> free = const {}}) => [
     ];
 
 class FakeBackground implements BackgroundService {
-  int inits = 0, starts = 0, stops = 0, updates = 0, batteryOpens = 0;
+  int inits = 0, starts = 0, stops = 0, updates = 0, batteryRequests = 0;
   bool startOk = true, alive = true;
+
+  /// 배터리 최적화에서 제외돼 있는지. 기본은 true 라서 대부분의 시험에는 안내 팝업이 뜨지 않는다.
+  bool batteryOk = true;
+
+  /// 시스템 허용 창에서 사용자가 "허용"을 누른 것으로 칠지.
+  bool batteryGrant = true;
 
   /// 있으면 stop() 이 이 Completer 가 끝날 때까지 기다린다 ("멈추는 중" 상태를 눈으로 확인하려고).
   Completer<void>? stopGate;
@@ -97,7 +134,13 @@ class FakeBackground implements BackgroundService {
   @override
   Future<bool> isAlive() async => alive;
   @override
-  Future<void> openBatterySettings() async => batteryOpens++;
+  Future<bool> isBatteryUnrestricted() async => batteryOk;
+  @override
+  Future<bool> requestBatteryUnrestricted() async {
+    batteryRequests++;
+    if (batteryGrant) batteryOk = true;
+    return batteryOk;
+  }
 }
 
 class FakeNotifier implements ResultNotifier {
@@ -129,6 +172,8 @@ class _NoRelease implements HttpClientAdapter {
   void close({bool force = false}) {}
 }
 
+Duration _sameInterval(Duration base, int? soonestMinutes) => base;
+
 class Rig {
   Rig({FakeLibrary? api, FakeBackground? bg, FakeNotifier? notifier})
       : api = api ?? FakeLibrary(),
@@ -153,6 +198,7 @@ class Rig {
           maxBackoff: Duration(milliseconds: 40),
           giveUpAfter: Duration(milliseconds: 400),
           maxReserveFailures: 3,
+          pacing: _sameInterval, // 남은 시간이 있어도 시험에서는 늘 짧은 간격
         ),
       );
 }
@@ -379,14 +425,173 @@ void main() {
     expect(find.text('지난 예약이 중간에 멈췄어요'), findsNothing);
   });
 
-  testWidgets('고급 설정의 "배터리 설정 열기"가 시스템 설정을 연다', (tester) async {
-    final rig = Rig();
+  testWidgets('처음 실행하고 배터리 제한이 켜져 있으면 안내 후 시스템 허용 창을 띄운다 (한 번만)', (tester) async {
+    final rig = Rig(bg: FakeBackground()..batteryOk = false);
     await _pumpApp(tester, rig);
+    await _settleAnim(tester);
+    expect(find.text('배터리 제한을 풀어 주세요'), findsOneWidget);
+    expect(rig.bg.batteryRequests, 0); // 설명을 읽기 전에는 시스템 창을 띄우지 않는다
+
+    await tester.tap(find.text('확인'));
+    await _settleAnim(tester);
+    expect(rig.bg.batteryRequests, 1);
+    expect(find.text('배터리 제한을 풀었어요.'), findsOneWidget);
+
+    // 같은 기기에서 앱을 다시 켜면 (제한이 다시 켜져 있어도) 또 묻지 않는다.
+    await tester.pumpWidget(const SizedBox()); // 앱을 완전히 내렸다가 새로 띄운다 (같은 화면 상태를 재사용하지 않도록)
+    final again = Rig(bg: FakeBackground()..batteryOk = false);
+    await _pumpApp(tester, again);
+    await _settleAnim(tester);
+    expect(find.text('배터리 제한을 풀어 주세요'), findsNothing);
+    expect(again.bg.batteryRequests, 0);
+  });
+
+  testWidgets('안내에서 "나중에"를 누르면 시스템 창을 띄우지 않고, 고급 설정에서 다시 풀 수 있다', (tester) async {
+    final rig = Rig(bg: FakeBackground()..batteryOk = false);
+    await _pumpApp(tester, rig);
+    await _settleAnim(tester);
+    await tester.tap(find.text('나중에'));
+    await _settleAnim(tester);
+    expect(rig.bg.batteryRequests, 0);
+
     await tester.tap(find.text('고급 설정'));
     await _settleAnim(tester);
-    await tester.tap(find.text('배터리 설정 열기'));
-    await tester.pump();
-    expect(rig.bg.batteryOpens, 1);
+    expect(find.textContaining('배터리 제한이 켜져 있으면'.keepWords), findsOneWidget);
+    await tester.tap(find.text('제한 풀기'));
+    await _settleAnim(tester);
+    expect(rig.bg.batteryRequests, 1);
+    expect(find.text('제한 풀기'), findsNothing); // 풀렸으니 버튼이 사라진다
+    expect(find.textContaining('배터리 제한이 풀려 있어요'.keepWords), findsOneWidget);
+  });
+
+  testWidgets('배터리 제한이 이미 풀려 있으면 안내를 띄우지 않는다', (tester) async {
+    final rig = Rig();
+    await _pumpApp(tester, rig);
+    await _settleAnim(tester);
+    expect(find.text('배터리 제한을 풀어 주세요'), findsNothing);
+    expect(rig.bg.batteryRequests, 0);
+    await tester.tap(find.text('고급 설정'));
+    await _settleAnim(tester);
+    expect(find.textContaining('배터리 제한이 풀려 있어요'.keepWords), findsOneWidget);
+    expect(find.text('제한 풀기'), findsNothing);
+  });
+
+  // ---------- 좌석 바꾸기 ----------
+
+  MyCharge heldSeat({bool returnable = false}) => MyCharge(
+        id: 900,
+        seatId: 107,
+        seatCode: '7',
+        roomId: 53,
+        roomName: '숭실스퀘어ON(2F)',
+        returnable: returnable,
+      );
+
+  Future<void> startAndWait(WidgetTester tester, {int ms = 400}) async {
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: ms);
+  }
+
+  testWidgets('좌석을 갖고 있으면 시작할 때 한 번 묻고, 바꾸기를 누르면 반납한 뒤 예약한다', (tester) async {
+    final api = FakeLibrary(script: [_seats(), _seats(), _seats(free: {5})], held: [heldSeat()]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5']);
+
+    await startAndWait(tester, ms: 100);
+    expect(find.text('7번 좌석을 반납하고 바꿀까요?'), findsOneWidget);
+    expect(find.textContaining('바꾸다 실패하면 좌석을 잃을 수 있어요'.keepWords), findsOneWidget); // 이 경고는 좌석이 있을 때만 나온다
+    expect(api.calls, isEmpty); // 대답하기 전에는 아무것도 건드리지 않는다
+
+    await tester.tap(find.text('바꾸기'));
+    await _settle(tester, ms: 400);
+
+    expect(api.calls, ['cancel:900', 'reserve:105']); // 내 7번을 내놓고(확정 전이라 취소) → 5번 예약
+    expect(find.text('배정 완료!'), findsWidgets);
+  });
+
+  testWidgets('"아니요"를 누르면 아무것도 하지 않고 예약도 시작하지 않는다', (tester) async {
+    final api = FakeLibrary(script: [_seats(free: {5})], held: [heldSeat()]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5']);
+
+    await startAndWait(tester, ms: 100);
+    await tester.tap(find.text('아니요'));
+    await _settle(tester, ms: 300);
+
+    expect(api.calls, isEmpty);
+    expect(find.text('중지하기'), findsNothing); // 도는 중이 아니다
+    expect(rig.bg.stops, 1); // 시작해 둔 백그라운드 서비스도 정리됐다
+    expect(find.byType(AlertDialog), findsNothing);
+  });
+
+  testWidgets('좌석이 없으면 묻지 않고, "좌석을 잃을 수 있어요" 경고도 어디에도 나오지 않는다', (tester) async {
+    final api = FakeLibrary(script: [_seats(), _seats(free: {5})]); // 갖고 있는 좌석 없음
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    expect(find.textContaining('잃을 수'), findsNothing); // 시작 전 화면에 없다
+    await _login(tester);
+    await _pickList(tester, ['5']);
+
+    await startAndWait(tester);
+
+    expect(find.textContaining('반납하고 바꿀까요'), findsNothing); // 물어볼 일이 없다
+    expect(api.calls, ['reserve:105']); // 반납 없이 예약만
+    expect(find.textContaining('잃을 수'), findsNothing);
+    expect(find.text('배정 완료!'), findsWidgets);
+  });
+
+  testWidgets('선택 목록에 내 좌석이 있으면 그 사실과 바꾸는 기준을 알려 주며 묻는다', (tester) async {
+    final api = FakeLibrary(script: [_seats()], held: [heldSeat()]); // 나는 7번, 선택은 5번 → 7번
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5', '7']);
+
+    await startAndWait(tester, ms: 100);
+    expect(find.textContaining('이 좌석은 선택한 목록에도 있어요'.keepWords), findsOneWidget);
+    expect(find.textContaining('7번보다 먼저 고른 좌석이 나면'.keepWords), findsOneWidget);
+
+    await tester.tap(find.text('아니요'));
+    await _settle(tester, ms: 200);
+  });
+
+  testWidgets('이미 이용 중(확정)인 좌석은 "이용 중인"이라고 알리고, 허락하면 반납 요청을 보낸다', (tester) async {
+    final api = FakeLibrary(script: [_seats(), _seats(free: {5})], held: [heldSeat(returnable: true)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5']);
+
+    await startAndWait(tester, ms: 100);
+    expect(find.textContaining('지금 이용 중인'.keepWords), findsOneWidget);
+    await tester.tap(find.text('바꾸기'));
+    await _settle(tester, ms: 400);
+
+    expect(api.calls, ['return:900', 'reserve:105']);
+  });
+
+  testWidgets('바꾸다 실패해 원래 좌석도 못 되찾으면 홈페이지에서 확인하라고 알린다', (tester) async {
+    final api = FakeLibrary(
+      script: [_seats(free: {5})],
+      held: [heldSeat()],
+      reserveResult: {'success': false, 'code': 'error.x', 'message': '이미 예약됨'},
+    );
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5']);
+
+    await startAndWait(tester, ms: 100);
+    await tester.tap(find.text('바꾸기'));
+    await _settle(tester, ms: 400);
+
+    expect(api.calls, ['cancel:900', 'reserve:105', 'reserve:107']);
+    expect(find.text('좌석을 바꾸다 실패했어요'), findsWidgets);
+    expect(find.textContaining('홈페이지에서 좌석을 확인해 주세요'.keepWords), findsWidgets);
   });
 
   testWidgets('저장된 오류 기록이 있으면 고급 설정에 보이고 지울 수 있다', (tester) async {

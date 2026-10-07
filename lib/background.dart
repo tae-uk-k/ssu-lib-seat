@@ -24,8 +24,12 @@ abstract class BackgroundService {
   /// 서비스가 아직 떠 있는지. 확인에 실패하면 true (살아 있다고 보고 계속한다).
   Future<bool> isAlive();
 
-  /// 폰의 배터리 최적화 설정 화면을 연다. 제조사 절전 기능이 백그라운드 앱을 끊을 때 사용자가 직접 풀 수 있게 한다.
-  Future<void> openBatterySettings();
+  /// 배터리 최적화에서 제외돼 있는지. 확인에 실패하면 true (괜한 안내를 띄우지 않는다).
+  Future<bool> isBatteryUnrestricted();
+
+  /// "항상 백그라운드에서 실행을 허용할까요?" 시스템 확인 창을 띄우고, 끝난 뒤 제외됐는지를 돌려준다.
+  /// 이 창을 못 띄우는 폰이면 배터리 최적화 목록 화면으로 대신 안내한다.
+  Future<bool> requestBatteryUnrestricted();
 }
 
 /// 예약 결과나 중단을 알리는 알림. 소리/진동이 있는 별도 채널을 쓴다.
@@ -130,11 +134,28 @@ class AndroidBackgroundService implements BackgroundService {
   }
 
   @override
-  Future<void> openBatterySettings() async {
+  Future<bool> isBatteryUnrestricted() async {
     try {
-      await FlutterForegroundTask.openIgnoreBatteryOptimizationSettings();
+      return await FlutterForegroundTask.isIgnoringBatteryOptimizations;
+    } catch (e) {
+      debugPrint('배터리 제한 확인 실패: $e');
+      return true;
+    }
+  }
+
+  @override
+  Future<bool> requestBatteryUnrestricted() async {
+    try {
+      return await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+    } catch (e) {
+      debugPrint('배터리 제한 해제 요청 실패: $e');
+    }
+    try {
+      // 목록 화면은 처음에 "최적화 안 함" 앱만 보여 줘서 이 앱이 안 보일 수 있다. 시스템 창이 안 될 때만 쓴다.
+      return await FlutterForegroundTask.openIgnoreBatteryOptimizationSettings();
     } catch (e) {
       debugPrint('배터리 설정 열기 실패: $e');
+      return false;
     }
   }
 }

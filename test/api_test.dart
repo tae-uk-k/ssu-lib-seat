@@ -110,6 +110,86 @@ void main() {
     });
   });
 
+  group('내 좌석', () {
+    // 홈페이지 "내 좌석" 목록이 쓰는 필드: id, seat.id/code, room.id/name, isReturnable.
+    Map<String, dynamic> charge({int id = 900, bool returnable = false}) => {
+          'id': id,
+          'seat': {'id': 107, 'code': '7'},
+          'room': {'id': 53, 'name': '숭실스퀘어ON(2F)'},
+          'state': {'code': 'RESERVED', 'name': '배정'},
+          'isReturnable': returnable,
+          'isCheckinable': true,
+        };
+
+    test('목록을 읽는다 (예약 번호와 좌석 번호는 다르다)', () async {
+      String? path;
+      final api = _api((o) {
+        path = o.path;
+        return _json({'success': true, 'data': {'list': [charge()]}});
+      });
+      final mine = await api.myCharges();
+      expect(path, endsWith('/1/api/seat-charges'));
+      expect(mine, hasLength(1));
+      expect(mine.first.id, 900);
+      expect(mine.first.seatId, 107);
+      expect(mine.first.seatCode, '7');
+      expect(mine.first.roomId, 53);
+      expect(mine.first.roomName, '숭실스퀘어ON(2F)');
+      expect(mine.first.returnable, isFalse);
+    });
+
+    test('isReturnable 이 true 면 이용 중으로 본다', () async {
+      final api = _api((_) => _json({'success': true, 'data': {'list': [charge(returnable: true)]}}));
+      expect((await api.myCharges()).first.returnable, isTrue);
+    });
+
+    test('기록이 없으면 빈 목록 (success.noRecord, data 없음도 포함)', () async {
+      expect(await _api((_) => _json({'success': true, 'code': 'success.noRecord'})).myCharges(), isEmpty);
+      expect(await _api((_) => _json({'success': false, 'code': 'success.noRecord'})).myCharges(), isEmpty);
+      expect(await _api((_) => _json({'success': true, 'data': {'list': []}})).myCharges(), isEmpty);
+    });
+
+    test('로그인이 풀리면 SessionException, 서버 오류와 이상한 모양은 ApiException', () async {
+      await expectLater(
+          _api((_) => _json({'success': false, 'code': 'error.unauthorized', 'message': '로그인 필요'})).myCharges(),
+          throwsA(isA<SessionException>()));
+      await expectLater(_api((_) => _json({'success': false}, 500)).myCharges(), throwsA(isA<ApiException>()));
+      await expectLater(_api((_) => _html()).myCharges(), throwsA(isA<ApiException>()));
+      await expectLater(
+          _api((_) => _json({'success': true, 'data': {'list': [{'id': 1}]}})).myCharges(), throwsA(isA<ApiException>()));
+    });
+
+    test('취소는 홈페이지와 같은 주소로 DELETE 하고 응답을 그대로 돌려준다', () async {
+      RequestOptions? seen;
+      final api = _api((o) {
+        seen = o;
+        return _json({'success': true});
+      });
+      final res = await api.cancelCharge(900);
+      expect(seen!.method, 'DELETE');
+      expect(seen!.path, endsWith('/1/api/seat-charges/900'));
+      expect(seen!.queryParameters['smufMethodCode'], 'PC');
+      expect(res['success'], isTrue);
+      final no = await _api((_) => _json({'success': false, 'code': 'error.x', 'message': '취소할 수 없습니다'})).cancelCharge(900);
+      expect(no['message'], '취소할 수 없습니다');
+    });
+
+    test('반납은 홈페이지와 같은 주소로 예약 번호를 POST 한다 (이용 중인 좌석용)', () async {
+      RequestOptions? seen;
+      final api = _api((o) {
+        seen = o;
+        return _json({'success': true});
+      });
+      final res = await api.returnCharge(900);
+      expect(seen!.method, 'POST');
+      expect(seen!.path, endsWith('/1/api/seat-discharges'));
+      expect(seen!.data, {'seatCharge': 900, 'smufMethodCode': 'PC'});
+      expect(res['success'], isTrue);
+      final no = await _api((_) => _json({'success': false, 'code': 'error.x', 'message': '반납할 수 없습니다'})).returnCharge(900);
+      expect(no['message'], '반납할 수 없습니다');
+    });
+  });
+
   test('예약 요청 응답은 그대로 돌려준다 (성공/실패 판단은 호출한 쪽)', () async {
     final ok = await _api((_) => _json({'success': true, 'data': {'id': 9}})).reserve(5);
     expect(ok['success'], isTrue);

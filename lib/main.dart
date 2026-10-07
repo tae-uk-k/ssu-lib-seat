@@ -109,6 +109,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   DateTime? _lastNotif;
   List<String> _crashes = [];
 
+  /// 배터리 최적화에서 제외돼 있는지. 아니면 화면을 꺼 둘 때 폰이 앱을 멈출 수 있다.
+  bool _batteryOk = true;
+
   // 앱 안 업데이트
   String _version = ''; // 지금 설치된 버전
   UpdateInfo? _update; // 더 높은 버전이 있으면 그 정보
@@ -141,6 +144,42 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     unawaited(_checkInterruptedRun());
     final crashes = await CrashLog.read();
     if (mounted) setState(() => _crashes = crashes);
+    await _refreshBattery();
+    await _offerBatteryOnce();
+  }
+
+  Future<void> _refreshBattery() async {
+    final ok = await widget.services.background.isBatteryUnrestricted();
+    if (mounted) setState(() => _batteryOk = ok);
+  }
+
+  /// 처음 실행할 때 한 번만, 배터리 제한을 풀어야 하는 이유를 알리고 시스템 허용 창을 띄운다.
+  /// 거절해도 다시 묻지 않는다 (고급 설정에서 언제든 다시 할 수 있다).
+  Future<void> _offerBatteryOnce() async {
+    if (_batteryOk || !mounted) return;
+    final p = await SharedPreferences.getInstance();
+    if (p.getBool('batteryAsked') == true || !mounted) return;
+    await p.setBool('batteryAsked', true);
+    if (!mounted) return;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('배터리 제한을 풀어 주세요'),
+        content: Text('화면을 꺼 두면 폰이 앱을 멈춰서 예약이 중간에 끊길 수 있어요. 다음 창에서 "허용"을 눌러 주세요.'.keepWords),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('나중에')),
+          TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('확인')),
+        ],
+      ),
+    );
+    if (go == true) await _requestBattery();
+  }
+
+  Future<void> _requestBattery() async {
+    final ok = await widget.services.background.requestBatteryUnrestricted();
+    if (!mounted) return;
+    setState(() => _batteryOk = ok);
+    _toast(ok ? '배터리 제한을 풀었어요.' : '배터리 제한이 그대로예요. 화면을 오래 꺼 두면 예약이 멈출 수 있어요.');
   }
 
   /// 지난번 예약이 정상적으로 끝나지 않고 앱이 사라졌는지 알아본다 (최근 앱에서 밀어 끔, 시스템 종료, 크래시).
@@ -245,6 +284,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _roomId = roomId;
       _selected = p.getStringList('sel_$roomId') ?? [];
     });
+  }
+
+  /// 이미 좌석을 갖고 있을 때만 불린다 (예약 루프가 시작할 때 내 좌석을 확인하고 부른다).
+  /// 좌석을 잃을 수 있다는 경고는 이때만 보여 준다. 앱이 보이지 않으면 물을 수 없으니 바꾸지 않는다.
+  Future<bool> _askReplace(MyCharge held, int rank) async {
+    if (!mounted || !_inForeground) return false;
+    final where = held.roomName.isEmpty ? '${held.seatCode}번' : '${held.roomName} ${held.seatCode}번';
+    final what = held.returnable ? '이용 중인' : '예약한';
+    final inList = rank > 0
+        ? '이 좌석은 선택한 목록에도 있어요. ${held.seatCode}번보다 먼저 고른 좌석이 나면 반납하고 바꾸고, 그보다 뒤에 고른 좌석으로는 바꾸지 않아요.'
+        : '선택한 좌석이 나면 ${held.seatCode}번을 반납하고 바꿔요.';
+    final ok = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (c) => AlertDialog(
+        title: Text('${held.seatCode}번 좌석을 반납하고 바꿀까요?'),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('지금 $what $where 좌석이 있어요. $inList'.keepWords),
+          const SizedBox(height: 12),
+          Text('바꾸다 실패하면 좌석을 잃을 수 있어요.'.keepWords,
+              style: TextStyle(fontSize: 12.5, color: Theme.of(c).colorScheme.error)),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('아니요')),
+          TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('바꾸기')),
+        ],
+      ),
+    );
+    return ok == true;
   }
 
   /// 열람실과 고른 좌석만 저장한다 (좌석을 누를 때마다 불리므로 가볍게 유지한다).
@@ -497,7 +565,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // 앱으로 돌아오면 그동안 쌓인 결과 안내가 보이도록 다시 그린다.
-    if (state == AppLifecycleState.resumed && mounted) setState(() {});
+    if (state == AppLifecycleState.resumed && mounted) {
+      setState(() {});
+      unawaited(_refreshBattery()); // 설정에서 바꾸고 돌아왔을 수 있다
+    }
   }
 
   Future<void> _start() async {
@@ -542,6 +613,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
       await RunMarker.begin(roomName, wanted.length);
       _log('$roomName · 좌석 ${wanted.join(', ')} 감시 시작');
+      if (!_batteryOk) _log('배터리 제한이 켜져 있어요. 화면을 오래 끄면 멈출 수 있으니 고급 설정에서 풀어 주세요.');
       final runner = ReservationRunner(
         roomId: roomId,
         wanted: wanted,
@@ -557,6 +629,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         onLog: _log,
         onStatus: (s) => _onRunStatus(s, roomName),
         isEnvironmentAlive: serviceUp ? bg.isAlive : null,
+        replaceExisting: true,
+        confirmReplace: _askReplace,
       );
       _runner = runner;
       if (!mounted) runner.stop();
@@ -625,6 +699,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ReserveRejected(:final seat, :final message) => _Notice(
           title: '${seat.code}번 좌석 예약이 계속 거절돼 멈췄어요',
           body: '$message\n이미 좌석을 배정받았거나 이용 제한 중일 수 있어요. 도서관 홈페이지에서 확인해 주세요.',
+        ),
+      KeepingSeat(:final held) => _Notice(
+          good: true,
+          title: '이미 가장 원하는 좌석이에요',
+          body: '${held.roomName} ${held.seatCode}번 좌석을 이미 갖고 있어요. 더 바꿀 좌석이 없어서 멈췄어요.',
+        ),
+      ReplaceFailed(:final wanted, :final old, :final restored, :final message) => _Notice(
+          title: restored ? '${wanted.code}번으로 바꾸지 못했어요' : '좌석을 바꾸다 실패했어요',
+          body: restored
+              ? '${wanted.code}번 예약이 거절돼($message) 원래 ${old.seatCode}번 좌석을 다시 예약했어요. '
+                  '${old.returnable ? '이용 시간은 새로 시작되고, 도착 확인(배정 확정)도 다시 해야 할 수 있어요. ' : ''}'
+                  '다른 사람이 먼저 예약한 것 같아요. 다시 하려면 아래에서 시작해 주세요.'
+              : '${old.seatCode}번 좌석을 반납했는데 ${wanted.code}번 예약이 거절됐고($message) '
+                  '${old.seatCode}번도 다시 예약하지 못했어요. 지금 도서관 홈페이지에서 좌석을 확인해 주세요.',
         ),
       EnvironmentLost() => const _Notice(
           title: '백그라운드 실행이 끝나 예약을 멈췄어요',
@@ -1078,7 +1166,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               keyboardType: const TextInputType.numberWithOptions(decimal: true),
               decoration: const InputDecoration(
                 labelText: '확인 간격(초)',
-                helperText: '짧을수록 빠르지만 서버에 부담이 가요. 최소 1초',
+                helperText: '곧 비는 좌석이 있을 때의 간격이에요 (멀면 자동으로 늦춰요). 최소 1초',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -1095,10 +1183,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ]),
             Row(children: [
               Expanded(
-                child: Text('오래 돌리다 끊기면 배터리 설정에서 이 앱을 "제한 없음"으로 바꿔 주세요.'.keepWords,
+                child: Text(
+                    (_batteryOk
+                            ? '배터리 제한이 풀려 있어요.'
+                            : '배터리 제한이 켜져 있으면 화면을 끈 채 오래 두었을 때 예약이 멈출 수 있어요.')
+                        .keepWords,
                     style: TextStyle(fontSize: 12.5, height: 1.4, color: Theme.of(context).colorScheme.onSurfaceVariant)),
               ),
-              TextButton(onPressed: widget.services.background.openBatterySettings, child: const Text('배터리 설정 열기')),
+              if (!_batteryOk) TextButton(onPressed: _requestBattery, child: const Text('제한 풀기')),
             ]),
             if (_crashes.isNotEmpty)
               Row(children: [
