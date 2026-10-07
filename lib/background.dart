@@ -42,6 +42,19 @@ class AndroidBackgroundService implements BackgroundService {
   // 매니페스트 <application> 의 meta-data 이름. 상태바에는 흰 단색 아이콘이 필요하다.
   static const _icon = NotificationIcon(metaDataName: 'kr.ssu.libseat.NOTIFICATION_ICON');
 
+  /// 서비스 옵션. 시험에서 설정이 슬며시 바뀌지 않았는지 확인하려고 따로 뺐다.
+  @visibleForTesting
+  static ForegroundTaskOptions taskOptions() => ForegroundTaskOptions(
+        eventAction: ForegroundTaskEventAction.nothing(),
+        allowWakeLock: true,
+        allowWifiLock: true,
+        // 예약 루프는 앱 안에서 돈다. 앱이 사라졌는데 서비스만 되살아나 "실행 중" 알림만 남으면 안 된다.
+        allowAutoRestart: false,
+        // stopWithTask 는 일부러 지정하지 않는다! 여기서 true 로 주면 이 플러그인은 "앱 화면이 하나도 안 보이는 순간"
+        // (홈 버튼, 화면 꺼짐, 다른 앱으로 전환) 서비스를 멈춘다 (v1.0.2~1.0.3 에서 홈 버튼만 눌러도 예약이 끝났던 원인).
+        // 지정하지 않으면 매니페스트의 android:stopWithTask="true" 를 따라, 최근 앱에서 밀어서 끌 때만 서비스가 같이 끝난다.
+      );
+
   @override
   Future<void> init() async {
     try {
@@ -52,14 +65,7 @@ class AndroidBackgroundService implements BackgroundService {
           channelDescription: '예약이 실행되는 동안 보이는 알림이에요.',
         ),
         iosNotificationOptions: const IOSNotificationOptions(),
-        foregroundTaskOptions: ForegroundTaskOptions(
-          eventAction: ForegroundTaskEventAction.nothing(),
-          allowWakeLock: true,
-          allowWifiLock: true,
-          // 예약 루프는 앱 안에서 돈다. 앱이 사라졌는데 서비스만 되살아나 "실행 중" 알림만 남으면 안 된다.
-          allowAutoRestart: false,
-          stopWithTask: true,
-        ),
+        foregroundTaskOptions: taskOptions(),
       );
     } catch (e) {
       debugPrint('BackgroundService.init 실패: $e');
