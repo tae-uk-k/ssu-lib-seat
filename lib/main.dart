@@ -100,7 +100,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final _id = TextEditingController();
   final _pw = TextEditingController();
   final _interval = TextEditingController(text: '1.5');
-  final _range = TextEditingController();
 
   late LibraryApi _api = widget.services.newApi();
   bool _loggedIn = false;
@@ -115,7 +114,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   List<Seat> _seatsApi = []; // API 순서 그대로 (도면은 순번으로 좌석을 찾는다)
   List<Seat> _seats = []; // 번호순 (목록 보기, 번호 범위 선택용)
   SeatLayout? _layout; // 홈페이지 도면이 있는 열람실만
-  bool _mapView = true;
   bool _loadingSeats = false;
   List<String> _selected = []; // 선택한 순서 = 우선순위
 
@@ -569,52 +567,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _toggle(s);
             setInner(() {});
           },
+          // 모두 해제는 도면을 크게 연 화면에만 있다 (예약이 도는 중에는 선택을 바꿀 수 없다).
+          onClear: _running
+              ? null
+              : () {
+                  _clearAll();
+                  setInner(() {});
+                },
         ),
       ),
     ));
   }
 
-  void _selectAll() {
-    setState(() => _selected = _seats.where((s) => s.active).map((s) => s.code).toList());
-    _saveSelection();
-  }
-
   void _clearAll() {
     setState(() => _selected = []);
     _saveSelection();
-  }
-
-  /// "25-40", "1, 3, 10~12" 같은 입력을 좌석 번호로 바꿔 선택한다.
-  void _applyRange() {
-    final wanted = <int>[];
-    for (final tok in _range.text.split(RegExp(r'[,\s]+'))) {
-      if (tok.isEmpty) continue;
-      final m = RegExp(r'^(\d+)\s*[-~]\s*(\d+)$').firstMatch(tok);
-      if (m != null) {
-        final a = int.parse(m.group(1)!), b = int.parse(m.group(2)!);
-        for (var n = a <= b ? a : b; n <= (a <= b ? b : a); n++) {
-          wanted.add(n);
-        }
-      } else if (int.tryParse(tok) != null) {
-        wanted.add(int.parse(tok));
-      } else {
-        _toast('"$tok"는 올바른 형식이 아니에요. 예: 25-40');
-        return;
-      }
-    }
-    final byNum = {for (final s in _seats) if (s.active && int.tryParse(s.code) != null) int.parse(s.code): s.code};
-    final picked = <String>[];
-    for (final n in wanted) {
-      final c = byNum[n];
-      if (c != null && !picked.contains(c)) picked.add(c);
-    }
-    if (picked.isEmpty) {
-      _toast('해당하는 좌석이 없어요.');
-      return;
-    }
-    setState(() => _selected = picked);
-    _saveSelection();
-    _toast('${picked.length}개 좌석을 선택했어요.');
   }
 
   // ---------- 4. 예약 ----------
@@ -1083,7 +1050,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _id.dispose();
     _pw.dispose();
     _interval.dispose();
-    _range.dispose();
     _runStatus.dispose();
     _renewStatus.dispose();
     _runLog.dispose();
@@ -1166,6 +1132,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ),
             const Divider(height: 1),
             const SizedBox(height: 4),
+            SwitchListTile(
+              secondary: const Icon(Icons.autorenew),
+              title: const Text('자동 연장'),
+              subtitle: Text(
+                  '이용 종료 ${widget.services.renewPolicy.threshold.inMinutes}분 전부터 연장해요. 안 되면 ${widget.services.renewPolicy.retryAfter.inMinutes}분 뒤 다시 시도해요.'
+                      .keepWords),
+              isThreeLine: true,
+              value: _autoRenew,
+              onChanged: _running ? null : _setAutoRenew,
+            ),
             ListTile(leading: const Icon(Icons.history), title: const Text('진행 기록'), onTap: _openLog),
             ListTile(
               leading: const Icon(Icons.timer_outlined),
@@ -1461,69 +1437,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _hint('좌석을 아직 불러오지 못했어요.'),
         TextButton.icon(onPressed: _loadSeats, icon: const Icon(Icons.refresh), label: const Text('다시 불러오기')),
       ]);
+    } else if (_layout case final layout?) {
+      // 도면이 있는 열람실: 작은 미리보기와, 크게 열어 고르는 버튼만 둔다 (범례·설명·고르기 도구는 크게 연 화면에 있다).
+      body = Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        SeatMapPreview(layout: layout, seats: _seatsApi, selected: _selected, onOpen: _openBigMap),
+        const SizedBox(height: 10),
+        OutlinedButton.icon(
+          onPressed: _openBigMap,
+          icon: const Icon(Icons.open_in_full, size: 18),
+          label: Text(_running ? '도면 크게 보기' : '도면에서 좌석 고르기'),
+        ),
+      ]);
     } else {
-      final layout = _layout;
-      final showMap = layout != null && _mapView;
+      // 도면이 없는 열람실(또는 도면을 못 읽었을 때)에서만 쓰는 대체 화면: 번호 카드를 눌러 고른다.
       body = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        if (layout != null) ...[
-          SizedBox(
-            width: double.infinity,
-            child: SegmentedButton<bool>(
-              showSelectedIcon: false,
-              segments: const [
-                ButtonSegment(value: true, icon: Icon(Icons.map_outlined), label: Text('도면으로 보기')),
-                ButtonSegment(value: false, icon: Icon(Icons.grid_view), label: Text('목록으로 보기')),
-              ],
-              selected: {_mapView},
-              onSelectionChanged: (v) => setState(() => _mapView = v.first),
-            ),
-          ),
-          const SizedBox(height: 12),
-        ],
-        if (showMap) SeatMapLegend(layout: layout) else const SeatLegend(),
+        const SeatLegend(),
         const SizedBox(height: 12),
-        Wrap(spacing: 8, runSpacing: 4, children: [
-          ActionChip(
-            avatar: const Icon(Icons.done_all, size: 18),
-            label: const Text('전체 선택'),
-            visualDensity: VisualDensity.compact,
-            onPressed: _running ? null : _selectAll,
-          ),
-          ActionChip(
-            avatar: const Icon(Icons.clear, size: 18),
-            label: const Text('모두 해제'),
-            visualDensity: VisualDensity.compact,
-            onPressed: _running ? null : _clearAll,
-          ),
-        ]),
-        const SizedBox(height: 12),
-        Row(children: [
-          Expanded(
-            child: TextField(
-              controller: _range,
-              enabled: !_running,
-              decoration: const InputDecoration(
-                isDense: true,
-                labelText: '번호로 한 번에 선택',
-                hintText: '예: 25-40, 52',
-              ),
-              onSubmitted: (_) => _applyRange(),
-            ),
-          ),
-          const SizedBox(width: 8),
-          FilledButton.tonal(onPressed: _running ? null : _applyRange, child: const Text('적용')),
-        ]),
-        const SizedBox(height: 14),
-        if (showMap) ...[
-          SeatMapPreview(layout: layout, seats: _seatsApi, selected: _selected, onOpen: _openBigMap),
-          const SizedBox(height: 8),
-          OutlinedButton.icon(
-            onPressed: _openBigMap,
-            icon: const Icon(Icons.open_in_full, size: 18),
-            label: Text(_running ? '도면 크게 보기' : '도면에서 좌석 고르기'),
-          ),
-        ] else
-          SeatGrid(seats: _seats, selected: _selected, onTap: _toggle),
+        SeatGrid(seats: _seats, selected: _selected, onTap: _toggle),
+        const SizedBox(height: 10),
+        ActionChip(
+          avatar: const Icon(Icons.clear, size: 18),
+          label: const Text('모두 해제'),
+          visualDensity: VisualDensity.compact,
+          onPressed: _running || _selected.isEmpty ? null : _clearAll,
+        ),
       ]);
     }
     return StepCard(
@@ -1546,49 +1483,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _startStep() {
     final scheme = Theme.of(context).colorScheme;
-    final renew = widget.services.renewPolicy;
     return StepCard(
       step: 4,
       title: '예약 시작',
-      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-        SwitchListTile(
-          contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-          tileColor: kAppBg,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          secondary: Icon(Icons.autorenew, color: scheme.primary),
-          value: _autoRenew,
-          onChanged: _running ? null : _setAutoRenew,
-          title: const Text('자동 연장', style: TextStyle(fontWeight: FontWeight.w600)),
-          subtitle: Text('이용 종료 ${renew.threshold.inMinutes}분 전부터 연장해요. 안 되면 ${renew.retryAfter.inMinutes}분 뒤 다시 시도해요.'.keepWords,
-              style: TextStyle(fontSize: 12, height: 1.35, color: scheme.onSurfaceVariant)),
-        ),
-        const SizedBox(height: 12),
-        SizedBox(
-          height: 52,
-          child: FilledButton.icon(
-            onPressed: switch (_phase) {
-              _Phase.idle => _start,
-              _Phase.running => _stop,
-              _ => null, // 시작하는 중, 멈추는 중에는 누를 수 없다
+      child: SizedBox(
+        height: 52,
+        width: double.infinity,
+        child: FilledButton.icon(
+          onPressed: switch (_phase) {
+            _Phase.idle => _start,
+            _Phase.running => _stop,
+            _ => null, // 시작하는 중, 멈추는 중에는 누를 수 없다
+          },
+          style: _phase == _Phase.running ? FilledButton.styleFrom(backgroundColor: scheme.error) : null,
+          icon: switch (_phase) {
+            _Phase.idle => const Icon(Icons.play_arrow),
+            _Phase.running => const Icon(Icons.stop),
+            _ => const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+          },
+          label: Text(
+            switch (_phase) {
+              _Phase.starting => '시작하는 중…',
+              _Phase.stopping => '멈추는 중…',
+              _Phase.running => '중지하기',
+              _Phase.idle => _selected.isEmpty ? (_autoRenew ? '자동 연장만 시작' : '예약 시작') : '선택한 ${_selected.length}개 좌석 예약 시작',
             },
-            style: _phase == _Phase.running ? FilledButton.styleFrom(backgroundColor: scheme.error) : null,
-            icon: switch (_phase) {
-              _Phase.idle => const Icon(Icons.play_arrow),
-              _Phase.running => const Icon(Icons.stop),
-              _ => const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
-            },
-            label: Text(
-              switch (_phase) {
-                _Phase.starting => '시작하는 중…',
-                _Phase.stopping => '멈추는 중…',
-                _Phase.running => '중지하기',
-                _Phase.idle => _selected.isEmpty ? (_autoRenew ? '자동 연장만 시작' : '예약 시작') : '선택한 ${_selected.length}개 좌석 예약 시작',
-              },
-              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-            ),
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
           ),
         ),
-      ]),
+      ),
     );
   }
 }

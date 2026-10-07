@@ -11,6 +11,7 @@ import 'package:lib_seat/auto_renewer.dart';
 import 'package:lib_seat/background.dart';
 import 'package:lib_seat/main.dart';
 import 'package:lib_seat/reservation_runner.dart';
+import 'package:lib_seat/seat_map.dart';
 import 'package:lib_seat/run_state.dart';
 import 'package:lib_seat/seat_layout.dart';
 import 'package:lib_seat/services.dart';
@@ -219,7 +220,7 @@ class _NewRelease implements HttpClientAdapter {
 Duration _sameInterval(Duration base, int? soonestMinutes) => base;
 
 class Rig {
-  Rig({FakeLibrary? api, FakeBackground? bg, FakeNotifier? notifier, this.desktop = false, this.newRelease = false})
+  Rig({FakeLibrary? api, FakeBackground? bg, FakeNotifier? notifier, this.desktop = false, this.newRelease = false, this.withMap = false})
       : api = api ?? FakeLibrary(),
         bg = bg ?? FakeBackground(),
         notifier = notifier ?? FakeNotifier();
@@ -235,6 +236,9 @@ class Rig {
   /// 새 버전이 나와 있다고 답하는 업데이트 서버를 쓴다.
   final bool newRelease;
 
+  /// 53번 열람실에 홈페이지 도면이 있는 것으로 한다. 끄면 도면이 없는 열람실이라 번호 카드로 좌석을 고른다 (대부분의 시험이 이쪽이 편하다).
+  final bool withMap;
+
   /// 컴퓨터용 업데이트 안내가 연 웹 주소들.
   final openedUrls = <String>[];
 
@@ -249,7 +253,7 @@ class Rig {
           openedUrls.add(url);
           return true;
         },
-        layoutFor: (room) async => room == 53 ? _layout53 : null,
+        layoutFor: (room) async => withMap && room == 53 ? _layout53 : null,
         // 자동 연장 시간표도 시험용으로 아주 짧게 (문턱 30분은 그대로)
         renewPolicy: const RenewPolicy(
           retryAfter: Duration(milliseconds: 60),
@@ -304,9 +308,7 @@ Future<void> _login(WidgetTester tester) async {
 }
 
 Future<void> _pickList(WidgetTester tester, List<String> codes) async {
-  // 목록으로 보기로 바꿔 좌석 카드를 직접 누른다 (도면 미리보기는 누르면 전체 화면이 열려서).
-  await tester.tap(find.text('목록으로 보기'));
-  await tester.pump();
+  // 도면이 없는 열람실이라 번호 카드가 보인다. 카드를 직접 눌러 고른다.
   for (final c in codes) {
     await tester.tap(find.text(c).first);
     await tester.pump();
@@ -837,23 +839,103 @@ void main() {
   // ---------- 메뉴와 정리된 화면 ----------
 
   testWidgets('메인 화면에는 설명 글과 설정이 없고, 메뉴에 모여 있다', (tester) async {
-    final rig = Rig(api: FakeLibrary(script: [_seats()]));
+    SharedPreferences.setMockInitialValues({}); // 자동 연장 기본값(켜짐)
+    final rig = Rig(api: FakeLibrary(script: [_seats()]), withMap: true);
     await _pumpApp(tester, rig);
     await _login(tester);
     // 지운 것들
-    for (final gone in ['지금 빈 좌석만', '고급 설정', '선택한 좌석 (우선순위 순)', '노란 숫자는 우선순위', '도면을 누르면 크게 열려요', '사용 중인 좌석도 고를 수 있', '아래 순서대로 따라 해 보세요', '진행 기록']) {
+    for (final gone in [
+      '지금 빈 좌석만', '고급 설정', '선택한 좌석 (우선순위 순)', '노란 숫자는 우선순위', '도면을 누르면 크게 열려요', '사용 중인 좌석도 고를 수 있',
+      '아래 순서대로 따라 해 보세요', '진행 기록', '전체 선택', '모두 해제', '번호로 한 번에 선택', '목록으로 보기', '도면으로 보기', '내가 고른 좌석',
+    ]) {
       expect(find.textContaining(gone), findsNothing, reason: gone);
     }
-    // 남은 것들
-    expect(find.text('전체 선택'), findsOneWidget);
-    expect(find.text('모두 해제'), findsOneWidget);
-    expect(find.text('자동 연장'), findsOneWidget);
+    expect(find.text('자동 연장'), findsNothing); // 스위치는 메뉴에 있다 (시작 버튼 글자 "자동 연장만 시작"과는 다르다)
+    // 남은 것들: 도면 미리보기와 크게 여는 버튼, 시작 버튼
+    expect(find.byType(SeatMapPreview), findsOneWidget);
+    expect(find.text('도면에서 좌석 고르기'), findsOneWidget);
+    expect(find.text('자동 연장만 시작'), findsOneWidget);
 
     await _openMenu(tester);
-    for (final item in ['진행 기록', '확인 간격', '업데이트 확인', '배터리 제한']) {
+    for (final item in ['자동 연장', '진행 기록', '확인 간격', '업데이트 확인', '배터리 제한']) {
       expect(find.text(item), findsOneWidget, reason: item);
     }
     expect(find.textContaining('버전 1.0.1'), findsWidgets);
+  });
+
+  testWidgets('도면을 크게 열면 범례와 모두 해제가 있고, 사용 설명 글은 없다', (tester) async {
+    final rig = Rig(api: FakeLibrary(script: [_seats()]), withMap: true);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await tester.tap(find.text('도면에서 좌석 고르기'));
+    await _settleAnim(tester);
+
+    expect(find.byType(SeatMapPage), findsOneWidget);
+    expect(find.text('내가 고른 좌석'), findsOneWidget); // 구역 색 범례는 크게 연 화면에만
+    for (final gone in ['확대/축소', '한 손가락', '이용 종료까지 남은 시간', '1:40']) {
+      expect(find.textContaining(gone), findsNothing, reason: gone);
+    }
+    final clear = find.widgetWithText(TextButton, '모두 해제');
+    expect(clear, findsOneWidget);
+    expect(tester.widget<TextButton>(clear).onPressed, isNull); // 고른 좌석이 없으면 누를 수 없다
+
+    // 보이는 좌석 하나를 눌러 고른다
+    final viewer = tester.getRect(find.byType(InteractiveViewer)).deflate(30);
+    String? hit;
+    for (var i = 1; i <= 12 && hit == null; i++) {
+      final f = find.text('$i');
+      if (f.evaluate().length == 1 && viewer.contains(tester.getCenter(f))) {
+        hit = '$i';
+        await tester.tapAt(tester.getCenter(f));
+        await tester.pump();
+      }
+    }
+    expect(hit, isNotNull);
+    expect(find.text('1개 선택'), findsOneWidget);
+    expect(tester.widget<TextButton>(clear).onPressed, isNotNull);
+
+    await tester.tap(clear);
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(find.text('0개 선택'), findsOneWidget);
+    expect((await SharedPreferences.getInstance()).getStringList('sel_53'), isEmpty);
+
+    await tester.tap(find.text('완료'));
+    await _settleAnim(tester);
+    expect(find.text('숭실스퀘어ON(2F) · 0개 선택됨'), findsOneWidget); // 메인의 좌석 단계에도 반영
+  });
+
+  testWidgets('예약이 도는 동안에는 도면을 크게 열어도 모두 해제가 없다', (tester) async {
+    SharedPreferences.setMockInitialValues({'autoRenew': false, 'sel_53': ['5']}); // 5번을 골라 둔 상태
+    final rig = Rig(api: FakeLibrary(script: [_seats()]), withMap: true);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: 200);
+
+    await tester.tap(find.text('도면 크게 보기'));
+    await _settle(tester, ms: 600);
+    expect(find.byType(SeatMapPage), findsOneWidget);
+    expect(find.text('모두 해제'), findsNothing);
+    await tester.tap(find.text('완료'));
+    await _settle(tester, ms: 400);
+    await tester.tap(find.text('중지하기'));
+    await _settle(tester, ms: 200);
+  });
+
+  testWidgets('도면이 없는 열람실에서는 번호 카드로 고르고, 거기에 모두 해제가 있다', (tester) async {
+    final rig = Rig(api: FakeLibrary(script: [_seats()])); // withMap: false
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    expect(find.byType(SeatMapPreview), findsNothing);
+    expect(find.text('도면에서 좌석 고르기'), findsNothing);
+    await _pickList(tester, ['5', '8']);
+    expect(find.textContaining('2개 선택됨'), findsOneWidget);
+    await tester.tap(find.text('모두 해제'));
+    await tester.pump();
+    expect(find.textContaining('0개 선택됨'), findsOneWidget);
+    for (final gone in ['전체 선택', '번호로 한 번에 선택', '목록으로 보기']) {
+      expect(find.textContaining(gone), findsNothing, reason: gone);
+    }
   });
 
   testWidgets('좌석을 고르고 시작하면 메뉴의 진행 기록에 쌓인다', (tester) async {
@@ -960,6 +1042,8 @@ void main() {
     SharedPreferences.setMockInitialValues({}); // 저장된 값 없음 = 기본값
     final rig = Rig();
     await _pumpApp(tester, rig);
+    expect(find.byType(Switch), findsNothing); // 메인에는 스위치가 없다
+    await _openMenu(tester);
     final sw = find.byType(Switch);
     expect(tester.widget<Switch>(sw).value, isTrue);
     expect(find.text('자동 연장만 시작'), findsOneWidget); // 좌석을 안 골랐고 자동 연장이 켜져 있으면
@@ -969,6 +1053,23 @@ void main() {
     expect(tester.widget<Switch>(sw).value, isFalse);
     expect(find.text('예약 시작'), findsWidgets);
     expect((await SharedPreferences.getInstance()).getBool('autoRenew'), isFalse);
+  });
+
+  testWidgets('예약이 도는 동안에는 메뉴의 자동 연장 스위치를 바꿀 수 없다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await tester.tap(find.text('자동 연장만 시작'));
+    await _settle(tester, ms: 200);
+    await tester.tap(find.byTooltip('메뉴'));
+    await _settle(tester, ms: 400);
+    expect(tester.widget<Switch>(find.byType(Switch)).onChanged, isNull);
+    await tester.tapAt(const Offset(780, 700)); // 메뉴 밖을 눌러 닫는다
+    await _settle(tester, ms: 400);
+    await tester.tap(find.text('중지하기'));
+    await _settle(tester, ms: 200);
   });
 
   testWidgets('좌석을 안 골랐고 자동 연장도 껐으면 시작할 수 없다', (tester) async {

@@ -379,6 +379,7 @@ class SeatMapPage extends StatelessWidget {
     required this.seats,
     required this.selected,
     required this.onTap,
+    this.onClear,
   });
 
   final String title;
@@ -387,25 +388,32 @@ class SeatMapPage extends StatelessWidget {
   final List<String> selected;
   final void Function(Seat) onTap;
 
+  /// 고른 좌석을 모두 해제한다. null 이면(예약이 도는 중처럼 바꿀 수 없을 때) 버튼을 보이지 않는다.
+  final VoidCallback? onClear;
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('$title · ${selected.length}개 선택', style: const TextStyle(fontSize: 16)),
-        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('완료'))],
+        // 위 줄에 고른 개수, 아래 줄에 열람실 이름 (이름이 길어도 오른쪽 버튼과 겹치지 않게 줄여서 보인다).
+        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${selected.length}개 선택', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          Text(title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.normal, color: Theme.of(context).colorScheme.outline)),
+        ]),
+        actions: [
+          if (onClear != null) TextButton(onPressed: selected.isEmpty ? null : onClear, child: const Text('모두 해제')),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('완료')),
+        ],
       ),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(12),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             SeatMapLegend(layout: layout),
-            const SizedBox(height: 4),
-            Text(
-                ('한 손가락으로 이동, 두 손가락으로 확대/축소해요. 좌석을 눌러 고르면 숫자(우선순위)가 붙어요.\n'
-                        '사용 중인 좌석 밑의 시간은 이용 종료까지 남은 시간이에요 (1:40 = 1시간 40분).')
-                    .keepWords,
-                style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.outline)),
-            const SizedBox(height: 8),
+            const SizedBox(height: 10),
             Expanded(child: SeatMapView(layout: layout, seats: seats, selected: selected, onTap: onTap)),
           ]),
         ),
