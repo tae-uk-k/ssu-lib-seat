@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
 import 'auto_renewer.dart';
+import 'my_seat_page.dart';
 import 'reservation_runner.dart';
 import 'run_state.dart';
 import 'seat_layout.dart';
@@ -144,7 +145,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _checkingUpdate = false;
   bool _updating = false;
   double? _updateProgress;
-  final _runLog = RunLog(); // 진행 기록 (메뉴에서 연다)
+  late final _runLog = RunLog(store: widget.services.logStore); // 진행 기록 (메뉴에서 연다, 앱을 껐다 켜도 남는다)
+  final _uiTick = ValueNotifier<int>(0); // 화면이 다시 그려질 때마다 올라간다 (내 좌석 화면이 같은 상태를 보게)
+  void Function()? _spawnRenewer; // 도는 중인 실행에 자동 연장을 새로 붙인다 (실행 중에 스위치를 켰을 때)
 
   Room? get _room {
     for (final r in _rooms) {
@@ -154,17 +157,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   @override
+  void setState(VoidCallback fn) {
+    super.setState(fn);
+    _uiTick.value++; // 내 좌석 화면이 이 화면과 같은 상태를 보게 한다
+  }
+
+  @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    CrashLog.listener = (m) => _log('오류: $m'); // 잡히지 않은 오류도 진행 기록에 남긴다
     _init();
     WidgetsBinding.instance.addPostFrameCallback((_) => _checkUpdate());
   }
 
   Future<void> _init() async {
+    await _runLog.restore(); // 지난 기록을 먼저 불러온다
+    String version = '?';
+    try {
+      version = (await PackageInfo.fromPlatform()).version;
+    } catch (_) {}
+    _log('=== 앱 시작 · 버전 $version · ${widget.services.desktop ? '컴퓨터' : '폰'} ===');
     await widget.services.background.init();
     await widget.services.notifier.init();
     await _restore();
+    unawaited(_autoLogin());
     unawaited(_loadLayout());
     unawaited(_loadRooms());
     unawaited(_checkInterruptedRun());
@@ -205,6 +222,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final ok = await widget.services.background.requestBatteryUnrestricted();
     if (!mounted) return;
     setState(() => _batteryOk = ok);
+    _log(ok ? '배터리 제한을 풀었어요' : '배터리 제한을 풀지 못했어요');
     _toast(ok ? '배터리 제한을 풀었어요.' : '배터리 제한이 그대로예요. 화면을 오래 꺼 두면 예약이 멈출 수 있어요.');
   }
 
@@ -257,19 +275,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     try {
       final current = (await PackageInfo.fromPlatform()).version;
       if (mounted) setState(() => _version = current);
-      if (!manual && await _checkedRecently()) return;
+      if (!manual && await _checkedRecently()) {
+        _log('업데이트 확인을 건너뛰었어요 (최근에 확인했어요)');
+        return;
+      }
       final latest = await widget.services.updater.latest();
       if (!mounted) return;
       if (latest != null && isNewerVersion(current, latest.version)) {
         setState(() => _update = latest);
+        _log('새 버전 ${latest.version} 이 있어요 (지금 $current)');
         if (manual) _toast('새 버전 ${latest.version}이 있어요. 맨 위의 업데이트 버튼을 눌러 주세요.');
       } else {
         unawaited(_markUpdateChecked());
+        _log('업데이트 확인: 최신 버전이에요 ($current)');
         if (manual) _toast('최신 버전이에요. ($current)');
       }
     } on UpdateException catch (e) {
+      _log('업데이트 확인 실패: ${e.message}');
       if (manual) _toast(e.message);
-    } catch (_) {
+    } catch (e) {
+      _log('업데이트 확인 실패: $e');
       if (manual) _toast('업데이트를 확인하지 못했어요.');
     } finally {
       if (mounted) setState(() => _checkingUpdate = false);
@@ -295,6 +320,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _updating = true;
       _updateProgress = null;
     });
+    _log('새 버전 ${u.version} 을 내려받아요');
     try {
       final dir = await getTemporaryDirectory();
       final apk = await widget.services.updater.download(u, dir.path, onProgress: (p) {
@@ -302,13 +328,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       });
       final res = await OpenFilex.open(apk.path, type: 'application/vnd.android.package-archive');
       if (res.type != ResultType.done) {
+        _log('설치 창을 열지 못했어요: ${res.message}');
         _toast('설치 창을 열지 못했어요. (${res.message})');
       } else {
+        _log('내려받기를 마치고 설치 창을 열었어요');
         _toast('설치 창에서 "설치"를 눌러 주세요. 처음이면 "이 출처 허용"을 켠 뒤 다시 업데이트 버튼을 눌러 주세요.');
       }
     } on UpdateException catch (e) {
+      _log('업데이트 실패: ${e.message}');
       _toast(e.message);
-    } catch (_) {
+    } catch (e) {
+      _log('업데이트 실패: $e');
       _toast('업데이트에 실패했어요. 잠시 후 다시 시도해 주세요.');
     } finally {
       if (mounted) {
@@ -383,11 +413,97 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// 자동 연장 스위치. 실행 중이면 바로 적용하고(켜면 도는 실행에 붙이고, 끄면 연장만 멈춘다),
+  /// 멈춰 있을 때 켜면 지금 좌석이 있는지 보고 곧바로 지켜보기 시작한다.
   Future<void> _setAutoRenew(bool on) async {
-    if (_running) return;
+    if (_autoRenew == on || _phase == _Phase.starting || _phase == _Phase.stopping) return;
     setState(() => _autoRenew = on);
+    _log('자동 연장을 ${on ? '켰어요' : '껐어요'}');
     final p = await SharedPreferences.getInstance();
     await p.setBool('autoRenew', on);
+    if (!mounted) return;
+    if (_phase == _Phase.running) {
+      if (on) {
+        _spawnRenewer?.call();
+      } else {
+        _renewer?.stop();
+      }
+    } else if (on) {
+      unawaited(_startRenewIfSeat());
+    }
+  }
+
+  /// 멈춰 있을 때 스위치를 켰다: 지금 좌석이 있으면 바로 연장을 지켜보기 시작한다.
+  Future<void> _startRenewIfSeat() async {
+    if (_phase != _Phase.idle) return;
+    if (!_loggedIn) {
+      _toast('자동 연장을 켰어요. 로그인한 뒤 "자동 연장만 시작"을 누르면 지켜봐요.');
+      return;
+    }
+    try {
+      final mine = await _api.myCharges();
+      if (!mounted || _phase != _Phase.idle || !_autoRenew) return;
+      if (mine.isEmpty) {
+        _log('자동 연장을 켰지만 지금 갖고 있는 좌석이 없어요');
+        _toast('자동 연장을 켰어요. 지금 갖고 있는 좌석이 없어요. 좌석을 잡은 뒤 "자동 연장만 시작"을 눌러 주세요.');
+        return;
+      }
+    } catch (e) {
+      _log('내 좌석을 확인하지 못했어요: $e');
+      _toast('자동 연장을 켰어요. 내 좌석을 확인하지 못했어요. 나중에 "자동 연장만 시작"을 눌러 주세요.');
+      return;
+    }
+    await _start(renewOnly: true);
+  }
+
+  /// 내 좌석 화면이 서버에서 내 좌석을 읽어 올 때 쓴다. 로그인이 풀렸으면 저장된 계정으로 한 번 다시 로그인한다.
+  Future<List<MyCharge>> _loadMine() async {
+    try {
+      final list = await _api.myCharges();
+      _log('내 좌석을 조회했어요 (${list.length}개)');
+      return list;
+    } on SessionException catch (e) {
+      if (_id.text.trim().isEmpty || _pw.text.isEmpty) rethrow;
+      _log('내 좌석 조회 중 로그인이 풀려 다시 로그인해요 (${e.message})');
+      final api = widget.services.newApi();
+      await api.login(_id.text.trim(), _pw.text); // 거절되면 LoginException 이 화면에 안내된다
+      _api = api;
+      final list = await api.myCharges();
+      _log('내 좌석을 조회했어요 (${list.length}개)');
+      return list;
+    } catch (e) {
+      _log('내 좌석 조회 실패: $e');
+      rethrow;
+    }
+  }
+
+  RenewView _renewView() => RenewView(
+        enabled: _autoRenew,
+        active: _renewer != null,
+        sessionRunning: _running,
+        threshold: widget.services.renewPolicy.threshold,
+        retryAfter: widget.services.renewPolicy.retryAfter,
+        status: _renewer != null ? _renewStatus.value : null,
+      );
+
+  /// 자동 연장이 지금 어떤지 한 줄로 (메뉴에 보인다).
+  String _renewSummary() => _renewer != null ? '자동 연장 동작 중' : (_autoRenew ? '자동 연장 켜짐' : '자동 연장 꺼짐');
+
+  void _openMySeat({bool fromMenu = false}) {
+    if (fromMenu) Navigator.pop(context); // 메뉴를 닫는다
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => ListenableBuilder(
+        listenable: Listenable.merge([_uiTick, _renewStatus]),
+        builder: (context, _) => MySeatPage(
+          loggedIn: _loggedIn,
+          load: _loadMine,
+          view: _renewView(),
+          onToggle: _setAutoRenew,
+          onStart: () => _start(renewOnly: true),
+          onLogin: _login,
+        ),
+      ),
+    ));
   }
 
   /// 계정과 확인 간격. 계정은 기기 암호화 저장소에 쓰므로 좌석을 누를 때마다 쓰지 않는다.
@@ -401,6 +517,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } else {
       await store.delete('pw');
     }
+    await store.delete(_autoLoginBlocked); // 계정을 새로 저장했으니 자동 로그인을 다시 허용한다
   }
 
   // ---------- 알림 ----------
@@ -430,9 +547,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 진행 기록에 한 줄 남긴다 ("10-09 14:03:22  내용"). 기록 화면만 다시 그려지고, 앱을 꺼도 남는다.
   void _log(String m) {
     if (!mounted) return;
-    _runLog.add('${DateTime.now().toString().substring(11, 19)}  $m'); // 기록 화면만 다시 그려진다
+    _runLog.add('${DateTime.now().toString().substring(5, 19)}  $m');
   }
 
   Future<void> _loginFailedDialog(LoginException e) => _dialog(
@@ -443,28 +561,53 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ---------- 1. 로그인 ----------
 
-  Future<void> _login() async {
+  /// 이 값이 저장소에 있으면 자동 로그인을 하지 않는다 (저장된 계정이 거절됐을 때, 계정을 새로 저장할 때까지).
+  static const _autoLoginBlocked = 'autoLoginBlocked';
+
+  /// 앱을 켤 때 저장된 계정으로 **딱 한 번** 로그인해 둔다. 로그인 버튼을 누르지 않아도 좌석 목록과 도면이 바로 보인다.
+  /// 저장된 계정이 거절되면 그 뒤로는 계정을 새로 저장할 때까지 시도하지 않는다 (켤 때마다 틀린 비밀번호로 시도하면 계정이 잠긴다).
+  /// 서버 오류나 인터넷 문제는 계정이 틀린 것이 아니므로 조용히 넘어가고, 다음에 켤 때 다시 시도한다.
+  Future<void> _autoLogin() async {
+    if (!_savePw || _id.text.trim().isEmpty || _pw.text.isEmpty) return;
+    if (await widget.services.secure.read(_autoLoginBlocked) != null) return;
+    await _login(auto: true);
+  }
+
+  Future<void> _login({bool auto = false}) async {
     if (_loggingIn || _running) return;
     if (_id.text.trim().isEmpty || _pw.text.isEmpty) {
-      _toast('학번과 비밀번호를 입력해 주세요.');
+      if (!auto) _toast('학번과 비밀번호를 입력해 주세요.');
       return;
     }
     setState(() => _loggingIn = true);
+    _log(auto ? '저장된 계정으로 자동 로그인을 시도해요' : '로그인을 시도해요');
     try {
       final api = widget.services.newApi();
       await api.login(_id.text.trim(), _pw.text);
       _api = api;
       if (!mounted) return;
       setState(() => _loggedIn = true);
-      await _saveAccount();
-      await _saveSelection();
+      _log('로그인했어요');
+      if (!auto) {
+        // 자동 로그인은 이미 저장된 값을 쓴 것이라 다시 쓰지 않는다.
+        await _saveAccount();
+        await _saveSelection();
+      }
       await _loadSeats();
     } on LoginException catch (e) {
-      await _loginFailedDialog(e);
+      _log('로그인이 거절됐어요: ${e.message}');
+      if (auto) {
+        await widget.services.secure.write(_autoLoginBlocked, '1');
+        _toast('저장된 학번이나 비밀번호가 맞지 않아 자동 로그인하지 않았어요. 확인한 뒤 직접 로그인해 주세요.');
+      } else {
+        await _loginFailedDialog(e);
+      }
     } on ApiException catch (e) {
-      _toast('도서관 서버가 지금 제대로 응답하지 않아요. 잠시 뒤 다시 시도해 주세요. (${e.message})');
-    } catch (_) {
-      _toast('네트워크 오류가 발생했어요. 인터넷 연결을 확인해 주세요.');
+      _log('로그인 중 서버 오류: ${e.message}');
+      if (!auto) _toast('도서관 서버가 지금 제대로 응답하지 않아요. 잠시 뒤 다시 시도해 주세요. (${e.message})');
+    } catch (e) {
+      _log('로그인 중 오류: $e');
+      if (!auto) _toast('네트워크 오류가 발생했어요. 인터넷 연결을 확인해 주세요.');
     } finally {
       if (mounted) setState(() => _loggingIn = false);
     }
@@ -482,7 +625,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final rooms = await _api.rooms();
       if (!mounted) return;
       setState(() => _rooms = rooms);
-    } catch (_) {
+      _log('열람실 ${rooms.length}곳을 불러왔어요');
+    } catch (e) {
+      _log('열람실 목록을 불러오지 못했어요: $e');
       if (mounted) setState(() => _roomsError = '열람실 목록을 불러오지 못했어요.');
     } finally {
       if (mounted) setState(() => _loadingRooms = false);
@@ -534,10 +679,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _seats = seats;
         _selected = _selected.where(codes.contains).toList();
       });
+      _log('${_room?.name ?? '열람실'} 좌석 ${seats.length}개를 불러왔어요');
       if (seats.isEmpty) _toast('이 열람실에는 좌석이 없어요.');
     } on SessionException catch (e) {
+      _log('좌석을 불러오지 못했어요 (로그인이 풀린 것 같아요): ${e.message}');
       _toast('좌석을 불러오지 못했어요. 다시 로그인해 보세요. (${e.message})');
-    } catch (_) {
+    } catch (e) {
+      _log('좌석을 불러오지 못했어요: $e');
       _toast('좌석을 불러오지 못했어요. 인터넷 연결을 확인해 주세요.');
     } finally {
       if (mounted) setState(() => _loadingSeats = false);
@@ -599,17 +747,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _start() async {
+  /// 예약(좌석을 골랐을 때)과 자동 연장(켜져 있을 때)을 시작한다.
+  /// [renewOnly] 이면 좌석을 고른 것과 상관없이 "이미 갖고 있는 좌석의 연장"만 지켜본다.
+  Future<void> _start({bool renewOnly = false}) async {
     if (_phase != _Phase.idle) return; // 연타하거나 멈추는 중에 눌러도 한 번만 시작한다
+    if (renewOnly && !_autoRenew) return;
     // 좌석을 골랐으면 예약 루프를 돌린다. 안 골랐어도 자동 연장이 켜져 있으면 "이미 갖고 있는 좌석의 연장"만 한다.
-    final hunt = _selected.isNotEmpty;
-    if ((hunt || !_autoRenew) && (_roomId == null || _room == null)) {
-      _toast('열람실을 먼저 선택해 주세요.');
-      return;
-    }
-    if (!hunt && !_autoRenew) {
-      _toast('예약할 좌석을 하나 이상 선택해 주세요.');
-      return;
+    final hunt = !renewOnly && _selected.isNotEmpty;
+    if (!renewOnly) {
+      if ((hunt || !_autoRenew) && (_roomId == null || _room == null)) {
+        _toast('열람실을 먼저 선택해 주세요.');
+        return;
+      }
+      if (!hunt && !_autoRenew) {
+        _toast('예약할 좌석을 하나 이상 선택해 주세요.');
+        return;
+      }
     }
     if (_id.text.trim().isEmpty || _pw.text.isEmpty) {
       _toast('학번과 비밀번호를 입력해 주세요.');
@@ -635,7 +788,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
     final bg = widget.services.background;
     RunOutcome? huntOutcome; // 예약 루프가 끝난 이유
-    RenewOutcome? renewOutcome; // 자동 연장이 끝난 이유
+    RenewOutcome? renewOutcome; // 자동 연장이 끝난 이유 (여러 번 껐다 켰으면 마지막 것)
     var huntAnnounced = false; // 예약 결과(배정 완료)를 이미 알리고 연장을 이어 갔는지
     var renewAnnounced = false; // 연장이 오류로 끝난 것을 이미 알렸는지
     ReservationRunner? runner; // 예외가 나도 finally 에서 둘 다 멈출 수 있게 밖에 둔다
@@ -649,15 +802,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         title: hunt ? '좌석 예약 실행 중' : '자동 연장 실행 중',
         text: hunt ? '$roomName · ${wanted.length}개 좌석 감시 중' : '내 좌석을 지켜보는 중',
       );
+      _log(serviceUp ? '백그라운드 서비스를 시작했어요' : '백그라운드 서비스를 시작하지 못했어요');
       if (!serviceUp) {
         _log('백그라운드 실행을 시작하지 못했어요. 앱을 켜 둔 동안에만 확실히 동작해요.');
         _toast('백그라운드 실행을 시작하지 못했어요. 앱을 켜 둔 채로 사용해 주세요.');
       }
       await RunMarker.begin(roomName, hunt ? wanted.length : 0);
-      if (hunt) _log('$roomName · 좌석 ${wanted.join(', ')} 감시 시작');
-      if (_autoRenew) {
-        _log('자동 연장 켜짐: 이용 종료 ${renewPolicy.threshold.inMinutes}분 전부터 연장하고, 안 되면 ${renewPolicy.retryAfter.inMinutes}분 뒤 다시 시도해요');
+      if (hunt) {
+        _log('$roomName · 좌석 ${wanted.join(', ')} 감시 시작');
+      } else {
+        _log('좌석 예약 없이 내 좌석의 연장만 지켜봐요');
       }
+      _log(_autoRenew
+          ? '자동 연장 켜짐: 이용 종료 ${renewPolicy.threshold.inMinutes}분 전부터 연장하고, 안 되면 ${renewPolicy.retryAfter.inMinutes}분 뒤 다시 시도해요'
+          : '자동 연장 꺼짐');
       if (!_batteryOk) _log('배터리 제한이 켜져 있어요. 화면을 오래 끄면 멈출 수 있으니 메뉴에서 풀어 주세요.');
       // 예약 루프와 연장 루프가 같은 로그인을 나눠 쓴다 (서로의 로그인을 끊지 않게).
       final shared = SharedLogin(() async {
@@ -667,6 +825,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         if (mounted) setState(() => _loggedIn = true);
         return api;
       });
+      SeatRenewer makeRenewer() => SeatRenewer(
+            policy: renewPolicy,
+            api: _loggedIn ? _api : null,
+            login: shared.call,
+            onLog: _log,
+            onStatus: _onRenewStatus,
+            onEvent: _onRenewEvent,
+            isEnvironmentAlive: serviceUp ? bg.isAlive : null,
+            waitForSeat: () => _runner != null, // 좌석을 노리는 예약 루프가 아직 돌면 좌석이 없어도 기다린다
+          );
       runner = !hunt
           ? null
           : ReservationRunner(
@@ -681,77 +849,95 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               replaceExisting: true,
               confirmReplace: _askReplace,
             );
-      renewer = !_autoRenew
-          ? null
-          : SeatRenewer(
-              policy: renewPolicy,
-              api: _loggedIn ? _api : null,
-              login: shared.call,
-              onLog: _log,
-              onStatus: _onRenewStatus,
-              onEvent: _onRenewEvent,
-              isEnvironmentAlive: serviceUp ? bg.isAlive : null,
-              waitForSeat: () => _runner != null, // 좌석을 노리는 예약 루프가 아직 돌면 좌석이 없어도 기다린다
-            );
-      final hunter = runner, watcher = renewer; // 아래 비동기 함수 안에서 null 이 아님을 쓰려고 한 번 더 받는다
+      if (_autoRenew) renewer = makeRenewer();
+
+      // 두 루프는 서로 독립이다. 어느 한쪽에서 예외가 나도 다른 쪽이 멈추지 않은 채 남지 않도록, 각자 오류를 결과로 바꿔 둔다.
+      Future<void> huntTask(ReservationRunner hunter) async {
+        try {
+          final o = await hunter.run();
+          huntOutcome = o;
+          _runner = null;
+          if (mounted) setState(() {}); // 실행 배너가 "연장만 지켜보는 중"으로 바뀌도록
+          // 좌석을 갖게 됐거나 (좌석 바꾸기를 "아니요" 해서) 갖고 있는 좌석을 그대로 두기로 했으면, 자동 연장이 켜져 있는 한 끝내지 않고
+          // 연장을 이어 간다. 사용자가 직접 멈췄거나 실패한 경우는 연장도 같이 끝낸다.
+          // (지금 연장을 지켜보고 있는지는 이 시점의 값을 본다. 실행 중에 스위치를 켜거나 껐을 수 있다.)
+          final declined = o is Stopped && !hunter.isStopped;
+          final w = _renewer;
+          if (w != null && (o is Reserved || o is KeepingSeat || declined)) {
+            huntAnnounced = true;
+            w.nudge(); // 좌석이 있으니 기다리지 말고 바로 확인한다
+            if (!declined && mounted) unawaited(_announceHunt(o, roomName));
+          } else {
+            _renewer?.stop();
+          }
+        } catch (e) {
+          huntOutcome ??= Crashed(e);
+          _runner = null;
+          _renewer?.stop();
+        }
+      }
+
+      Future<void> renewTask(SeatRenewer watcher) async {
+        try {
+          final o = await watcher.run();
+          renewOutcome = o;
+          if (identical(_renewer, watcher)) _renewer = null;
+          if (mounted) setState(() {}); // "동작 중" 표시가 꺼지도록
+          // 연장이 오류로 먼저 끝나도 예약 루프는 계속 돈다. 그럴 때는 바로 알린다 (그 밖의 이유는 예약 루프가 같이 알린다).
+          if (o.reason == RenewEndReason.crashed && _runner != null && mounted) {
+            renewAnnounced = true;
+            unawaited(_announceRenewEnd(o));
+          }
+        } catch (e) {
+          renewOutcome ??= RenewOutcome(RenewEndReason.crashed, message: '$e', error: e);
+          if (identical(_renewer, watcher)) _renewer = null;
+        }
+      }
+
+      final tasks = <Future<void>>[];
+
+      /// 도는 실행에 자동 연장을 새로 붙인다 (실행 중에 스위치를 켰을 때).
+      void spawnRenewer() {
+        if (_renewer != null || _phase != _Phase.running) return;
+        final w = makeRenewer();
+        renewer = w;
+        _renewer = w;
+        _log('도는 실행에 자동 연장을 붙였어요');
+        tasks.add(renewTask(w));
+        if (mounted) setState(() {});
+      }
+
+      final hunter = runner;
       _runner = hunter;
-      _renewer = watcher;
+      _renewer = renewer;
       if (!mounted) {
         hunter?.stop();
-        watcher?.stop();
+        renewer?.stop();
       }
       if (mounted) setState(() => _phase = _Phase.running);
-      // 두 루프는 서로 독립이다. 어느 한쪽에서 예외가 나도 다른 쪽이 멈추지 않은 채 남지 않도록, 각자 오류를 결과로 바꿔 둔다.
-      await Future.wait([
-        if (hunter != null)
-          () async {
-            try {
-              final o = await hunter.run();
-              huntOutcome = o;
-              _runner = null;
-              if (mounted) setState(() {}); // 실행 배너가 "연장만 지켜보는 중"으로 바뀌도록
-              // 좌석을 갖게 됐거나 (좌석 바꾸기를 "아니요" 해서) 갖고 있는 좌석을 그대로 두기로 했으면, 자동 연장이 켜져 있는 한 끝내지 않고
-              // 연장을 이어 간다. 사용자가 직접 멈췄거나 실패한 경우는 연장도 같이 끝낸다.
-              final declined = o is Stopped && !hunter.isStopped;
-              if (watcher != null && (o is Reserved || o is KeepingSeat || declined)) {
-                huntAnnounced = true;
-                watcher.nudge(); // 좌석이 있으니 기다리지 말고 바로 확인한다
-                if (!declined && mounted) unawaited(_announceHunt(o, roomName));
-              } else {
-                watcher?.stop();
-              }
-            } catch (e) {
-              huntOutcome ??= Crashed(e);
-              _runner = null;
-              watcher?.stop();
-            }
-          }(),
-        if (watcher != null)
-          () async {
-            try {
-              final o = await watcher.run();
-              renewOutcome = o;
-              _renewer = null;
-              // 연장이 오류로 먼저 끝나도 예약 루프는 계속 돈다. 그럴 때는 바로 알린다 (그 밖의 이유는 예약 루프가 같이 알린다).
-              if (o.reason == RenewEndReason.crashed && _runner != null && mounted) {
-                renewAnnounced = true;
-                unawaited(_announceRenewEnd(o));
-              }
-            } catch (e) {
-              renewOutcome ??= RenewOutcome(RenewEndReason.crashed, message: '$e', error: e);
-              _renewer = null;
-            }
-          }(),
-      ]);
+      _spawnRenewer = spawnRenewer;
+      if (hunter != null) tasks.add(huntTask(hunter));
+      final first = renewer;
+      if (first != null) tasks.add(renewTask(first));
+      // 기다리는 동안 새로 붙은 작업(실행 중에 켠 자동 연장)까지 모두 끝나야 실행이 끝난다.
+      var waited = 0;
+      while (waited < tasks.length) {
+        final upto = tasks.length;
+        await Future.wait(tasks.sublist(waited, upto));
+        waited = upto;
+      }
+      _spawnRenewer = null; // 끝난 실행에는 더 붙이지 않는다
     } catch (e) {
       setupError = e;
     } finally {
+      _spawnRenewer = null;
       runner?.stop(); // 이미 끝났으면 아무 일도 없다
       renewer?.stop();
       _runner = null;
       _renewer = null;
       await RunMarker.end();
       await bg.stop();
+      _log('백그라운드 서비스를 정리했어요');
     }
     if (!mounted) return;
     final hunted = huntOutcome ?? (hunt || setupError != null ? Crashed(setupError ?? '예약을 시작하지 못했어요') : null);
@@ -760,6 +946,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _stop() {
     if (_phase != _Phase.running) return;
+    _log('중지를 눌렀어요');
     setState(() => _phase = _Phase.stopping);
     _runner?.stop();
     _renewer?.stop();
@@ -1003,6 +1190,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _lastResult = notice;
       if (loginRejected != null) _loggedIn = false; // 다시 로그인하도록
     });
+    if (loginRejected != null) unawaited(widget.services.secure.write(_autoLoginBlocked, '1')); // 저장된 계정이 틀렸다
     if (notice == null) return;
     await _tell(notice, loginRejectedMessage: loginRejected);
   }
@@ -1052,7 +1240,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _interval.dispose();
     _runStatus.dispose();
     _renewStatus.dispose();
+    CrashLog.listener = null;
     _runLog.dispose();
+    _uiTick.dispose();
     super.dispose();
   }
 
@@ -1132,15 +1322,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ),
             const Divider(height: 1),
             const SizedBox(height: 4),
-            SwitchListTile(
-              secondary: const Icon(Icons.autorenew),
-              title: const Text('자동 연장'),
-              subtitle: Text(
-                  '이용 종료 ${widget.services.renewPolicy.threshold.inMinutes}분 전부터 연장해요. 안 되면 ${widget.services.renewPolicy.retryAfter.inMinutes}분 뒤 다시 시도해요.'
-                      .keepWords),
-              isThreeLine: true,
-              value: _autoRenew,
-              onChanged: _running ? null : _setAutoRenew,
+            ListTile(
+              leading: Icon(_renewer != null ? Icons.autorenew : Icons.event_seat_outlined,
+                  color: _renewer != null ? kGreen : null),
+              title: const Text('내 좌석'),
+              subtitle: Text(_renewSummary()),
+              onTap: () => _openMySeat(fromMenu: true),
             ),
             ListTile(leading: const Icon(Icons.history), title: const Text('진행 기록'), onTap: _openLog),
             ListTile(
@@ -1280,25 +1467,34 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  /// 실행 배너에 붙는 자동 연장 상태 (자동 연장이 켜져 있을 때만).
+  /// 실행 배너에 붙는 자동 연장 상태. 지금 동작 중인지, 꺼져 있는지가 한눈에 보이게 맨 위에 표시를 둔다.
   List<Widget> _renewLines(Color fg, ColorScheme scheme) {
-    if (_renewer == null) return const [];
+    final style = TextStyle(fontSize: 12.5, color: fg);
+    Widget badge(IconData icon, String text, {bool bold = true}) => Padding(
+          padding: const EdgeInsets.only(top: 2),
+          child: Row(children: [
+            Icon(icon, size: 16, color: fg),
+            const SizedBox(width: 6),
+            Expanded(child: Text(text, style: TextStyle(fontSize: 13, fontWeight: bold ? FontWeight.bold : null, color: fg))),
+          ]),
+        );
+    if (_renewer == null) return [badge(Icons.pause_circle_outline, '자동 연장 꺼짐', bold: false)];
     final p = widget.services.renewPolicy;
     final r = _renewStatus.value;
     final held = r?.held;
-    final rem = held?.remainingMinutes;
-    final style = TextStyle(fontSize: 12.5, color: fg);
-    final String line;
-    if (r == null) {
-      line = '자동 연장: 내 좌석을 확인하는 중…';
-    } else if (held == null) {
-      line = '자동 연장: 연장할 좌석이 아직 없어요. 좌석이 생기면 지켜봐요.';
-    } else {
-      line = '자동 연장: ${held.seatCode}번 좌석${rem == null ? '' : ' · 이용 종료까지 ${longRemaining(rem)}'}'
-          ' (${_hm(r.checkedAt)} 확인). 종료 ${p.threshold.inMinutes}분 전부터 연장해요.';
-    }
+    final timing = (held == null || r == null) ? null : renewTimingText(held, r.checkedAt, p.threshold);
     return [
-      Text(line.keepWords, style: style),
+      badge(Icons.autorenew, '자동 연장 동작 중'),
+      if (r == null) Text('내 좌석을 확인하는 중…', style: style),
+      if (r != null && held == null) Text('연장할 좌석이 아직 없어요. 좌석이 생기면 지켜봐요.'.keepWords, style: style),
+      if (held != null && r != null) ...[
+        Text(
+            '${held.seatCode}번 좌석${held.remainingMinutes == null ? '' : ' · 이용 종료까지 ${longRemaining(held.remainingMinutes!)}'}'
+                    ' (${_hm(r.checkedAt)} 확인)'
+                .keepWords,
+            style: style),
+        if (timing != null) Text(timing.keepWords, style: style),
+      ],
       if (r != null && r.renewed > 0) Text('이번 실행에서 ${r.renewed}번 연장했어요.', style: style),
       if (r != null && r.failStreak > 0)
         Text('연장에 실패했어요 (${r.lastFailure}). ${p.retryAfter.inMinutes}분마다 다시 시도해요.'.keepWords,
@@ -1486,31 +1682,59 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return StepCard(
       step: 4,
       title: '예약 시작',
-      child: SizedBox(
-        height: 52,
-        width: double.infinity,
-        child: FilledButton.icon(
-          onPressed: switch (_phase) {
-            _Phase.idle => _start,
-            _Phase.running => _stop,
-            _ => null, // 시작하는 중, 멈추는 중에는 누를 수 없다
-          },
-          style: _phase == _Phase.running ? FilledButton.styleFrom(backgroundColor: scheme.error) : null,
-          icon: switch (_phase) {
-            _Phase.idle => const Icon(Icons.play_arrow),
-            _Phase.running => const Icon(Icons.stop),
-            _ => const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
-          },
-          label: Text(
-            switch (_phase) {
-              _Phase.starting => '시작하는 중…',
-              _Phase.stopping => '멈추는 중…',
-              _Phase.running => '중지하기',
-              _Phase.idle => _selected.isEmpty ? (_autoRenew ? '자동 연장만 시작' : '예약 시작') : '선택한 ${_selected.length}개 좌석 예약 시작',
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        SizedBox(
+          height: 52,
+          child: FilledButton.icon(
+            onPressed: switch (_phase) {
+              _Phase.idle => _start,
+              _Phase.running => _stop,
+              _ => null, // 시작하는 중, 멈추는 중에는 누를 수 없다
             },
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            style: _phase == _Phase.running ? FilledButton.styleFrom(backgroundColor: scheme.error) : null,
+            icon: switch (_phase) {
+              _Phase.idle => const Icon(Icons.play_arrow),
+              _Phase.running => const Icon(Icons.stop),
+              _ => const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+            },
+            label: Text(
+              switch (_phase) {
+                _Phase.starting => '시작하는 중…',
+                _Phase.stopping => '멈추는 중…',
+                _Phase.running => '중지하기',
+                _Phase.idle => _selected.isEmpty ? (_autoRenew ? '자동 연장만 시작' : '예약 시작') : '선택한 ${_selected.length}개 좌석 예약 시작',
+              },
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
           ),
         ),
+        // 도는 동안에는 위의 실행 배너가 자동 연장 상태를 보여 준다. 멈춰 있을 때만 켜짐/꺼짐을 알려 준다.
+        if (!_running) ...[
+          const SizedBox(height: 10),
+          _renewChip(scheme),
+        ],
+      ]),
+    );
+  }
+
+  /// 자동 연장이 켜져 있는지 보여 준다. 누르면 내 좌석 화면으로 가서 켜고 끌 수 있다.
+  Widget _renewChip(ColorScheme scheme) {
+    final on = _autoRenew;
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: _openMySeat,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(color: kAppBg, borderRadius: BorderRadius.circular(12)),
+        child: Row(children: [
+          Icon(on ? Icons.autorenew : Icons.pause_circle_outline, size: 18, color: on ? scheme.primary : scheme.outline),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(on ? '자동 연장 켜짐 · 시작하면 함께 동작해요' : '자동 연장 꺼짐',
+                style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
+          ),
+          Icon(Icons.chevron_right, size: 18, color: scheme.outline),
+        ]),
       ),
     );
   }

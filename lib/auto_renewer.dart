@@ -201,6 +201,7 @@ class SeatRenewer {
   MyCharge? _last;
   DateTime? _lastRenewedAt;
   String _lastLogged = '';
+  String _lastCheck = '';
   int _repeat = 0;
 
   bool get isStopped => _stopped;
@@ -326,6 +327,7 @@ class SeatRenewer {
     onStatus(_status(held));
     final rem = held.remainingMinutes;
     final limit = policy.threshold.inMinutes;
+    _noteCheck(held, rem);
 
     final renewedAt = _lastRenewedAt;
     if (renewedAt != null) {
@@ -377,6 +379,14 @@ class SeatRenewer {
     onEvent(RenewEvent(RenewEventKind.failed, held, why, count: _renewed, failStreak: _failStreak, retryIn: policy.retryAfter));
     onStatus(_status(held));
     return policy.retryAfter;
+  }
+
+  /// 내 좌석을 확인할 때마다 한 줄 남긴다 (연장이 지금 돌고 있는지 진행 기록에서 보이게). 직전과 같은 내용이면 건너뛴다.
+  void _noteCheck(MyCharge held, int? rem) {
+    final line = '내 좌석 확인: ${held.seatCode}번 · ${rem == null ? '남은 시간을 몰라요' : '남은 $rem분'}${held.returnable ? '' : ' (이용 시작 전)'}';
+    if (line == _lastCheck) return;
+    _lastCheck = line;
+    onLog(line);
   }
 
   /// 연장 요청. 성공하면 null, 실패하면 이유.

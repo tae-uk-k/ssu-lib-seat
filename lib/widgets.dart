@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'api.dart';
 import 'run_state.dart';
@@ -22,34 +23,75 @@ extension KeepWords on String {
   String get keepWords => replaceAllMapped(RegExp(r'(?<=\S)(?=\S)'), (_) => '\u2060');
 }
 
-/// 진행 기록 화면. 새 기록이 생기면 이 화면만 갱신된다.
+/// 진행 기록 화면. 앱이 한 일(로그인, 예약, 연장, 업데이트, 오류 등)이 시각과 함께 쌓이고, 새 기록이 생기면 이 화면만 갱신된다.
+/// 복사해서 보낼 수 있고, 지울 수도 있다.
 class RunLogPage extends StatelessWidget {
   const RunLogPage({super.key, required this.log});
 
   final RunLog log;
 
-  /// "12:34:56  내용" 모양의 한 줄을 시각(흐리게)과 내용으로 나눠 그린다.
+  /// "10-09 12:34:56  내용" 모양의 한 줄을 시각(흐리게)과 내용으로 나눠 그린다.
+  static final _stamp = RegExp(r'^([0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})  (.*)$');
+
   static Widget _line(BuildContext context, String line) {
     final dim = Theme.of(context).colorScheme.outline;
-    final hasTime = line.length > 10 && line[2] == ':' && line[5] == ':';
+    final m = _stamp.firstMatch(line);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
       child: Text.rich(
         TextSpan(children: [
-          if (hasTime) TextSpan(text: '${line.substring(0, 8)}  ', style: TextStyle(color: dim)),
-          TextSpan(text: hasTime ? line.substring(10) : line),
+          if (m != null) TextSpan(text: '${m.group(1)}  ', style: TextStyle(color: dim)),
+          TextSpan(text: m != null ? m.group(2) : line),
         ]),
         style: const TextStyle(fontSize: 12.5, height: 1.35),
       ),
     );
   }
 
+  Future<void> _copy(BuildContext context) async {
+    await Clipboard.setData(ClipboardData(text: log.text));
+    if (context.mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('진행 기록을 복사했어요.')));
+    }
+  }
+
+  Future<void> _clear(BuildContext context) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('진행 기록을 지울까요?'),
+        content: const Text('저장된 기록이 모두 사라져요.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('취소')),
+          TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('지우기')),
+        ],
+      ),
+    );
+    if (ok == true) await log.clear();
+  }
+
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: const Text('진행 기록')),
-        body: ListenableBuilder(
-          listenable: log,
-          builder: (context, _) => log.length == 0
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: log,
+        builder: (context, _) => Scaffold(
+          appBar: AppBar(
+            title: Text(log.length == 0 ? '진행 기록' : '진행 기록 (${log.length})'),
+            actions: [
+              IconButton(
+                tooltip: '복사',
+                onPressed: log.length == 0 ? null : () => _copy(context),
+                icon: const Icon(Icons.copy_all_outlined),
+              ),
+              IconButton(
+                tooltip: '지우기',
+                onPressed: log.length == 0 ? null : () => _clear(context),
+                icon: const Icon(Icons.delete_outline),
+              ),
+            ],
+          ),
+          body: log.length == 0
               ? Center(child: Text('아직 기록이 없어요.', style: TextStyle(color: Theme.of(context).colorScheme.outline)))
               : ListView.builder(
                   // 가장 새 기록이 맨 위에 온다 (기록이 몇 줄 안 될 때도 위에서부터 읽힌다).

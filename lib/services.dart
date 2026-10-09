@@ -1,14 +1,16 @@
-import 'dart:io' show Platform;
+import 'dart:io' show File, Platform;
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'api.dart';
 import 'auto_renewer.dart';
 import 'background.dart';
 import 'open_url.dart';
 import 'reservation_runner.dart';
+import 'run_state.dart';
 import 'seat_layout.dart';
 import 'update_check.dart';
 
@@ -73,6 +75,7 @@ class AppServices {
     this.layoutFor = _defaultLayout,
     this.policyFor = _defaultPolicy,
     this.renewPolicy = const RenewPolicy(),
+    this.logStore = const NoLogStore(),
     this.wrapRoot = _identity,
     this.desktop = false,
     this.openUrl = openInBrowser,
@@ -86,6 +89,8 @@ class AppServices {
       notifier: LocalResultNotifier(),
       secure: DeviceSecureStore(),
       updater: UpdateChecker(),
+      // 진행 기록은 앱 전용 폴더의 파일에 저장해서, 앱을 껐다 켜도 지난 기록을 볼 수 있다.
+      logStore: FileLogStore(() async => File('${(await getApplicationSupportDirectory()).path}/run_log.txt')),
       // 뒤로 가기로 앱을 내리는 플러그인 위젯은 안드로이드 전용이다.
       wrapRoot: desktop ? _identity : (child) => WithForegroundTask(child: child),
       desktop: desktop,
@@ -107,6 +112,9 @@ class AppServices {
 
   /// 자동 연장 시간표 (종료 30분 전부터, 실패하면 5분 뒤 재시도). 시험에서는 아주 짧게 바꿔 끼운다.
   final RenewPolicy renewPolicy;
+
+  /// 진행 기록을 보관하는 곳. 시험에서는 저장하지 않는다.
+  final LogStore logStore;
 
   /// 맨 위 위젯을 감싼다. 실제 앱에서는 뒤로 가기 때 앱을 닫지 않고 내려 주는 플러그인 위젯을 씌운다.
   final Widget Function(Widget child) wrapRoot;
