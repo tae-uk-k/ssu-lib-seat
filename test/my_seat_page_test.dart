@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lib_seat/api.dart';
 import 'package:lib_seat/auto_renewer.dart';
 import 'package:lib_seat/my_seat_page.dart';
+import 'package:lib_seat/widgets.dart';
 
 MyCharge _charge({int? remaining = 100, bool inUse = true, bool? renewable}) => MyCharge(
       id: 900,
@@ -72,6 +75,7 @@ void main() {
       required RenewView v,
       void Function(bool)? onToggle,
       VoidCallback? onStart,
+      Future<String?> Function(MyCharge)? onReturn,
     }) async {
       tester.view.physicalSize = const Size(800, 1600);
       tester.view.devicePixelRatio = 1;
@@ -84,6 +88,7 @@ void main() {
           onToggle: onToggle ?? (_) {},
           onStart: onStart ?? () {},
           onLogin: () async {},
+          onReturn: onReturn ?? (_) async => null,
         ),
       ));
       await tester.pump();
@@ -133,6 +138,120 @@ void main() {
       await pump(tester, load: load, v: view(active: true, running: true, status: st));
       expect(find.text('40분'), findsOneWidget);
       expect(loads, 1, reason: '연장 루프의 최근 확인을 쓰므로 서버에 다시 묻지 않는다');
+    });
+
+    group('반납', () {
+      testWidgets('이용 중인 좌석에는 "반납하기", 이용 시작 전 좌석에는 "배정 취소하기" 버튼이 있다', (tester) async {
+        await pump(tester, load: () async => [_charge()], v: view());
+        expect(find.text('반납하기'), findsOneWidget);
+        expect(find.text('배정 취소하기'), findsNothing);
+
+        await tester.pumpWidget(const SizedBox()); // 화면을 새로 열어야 목록을 다시 읽는다
+        await pump(tester, load: () async => [_charge(inUse: false)], v: view());
+        expect(find.text('배정 취소하기'), findsOneWidget);
+        expect(find.text('반납하기'), findsNothing);
+
+        await tester.pumpWidget(const SizedBox());
+        await pump(tester, load: () async => [], v: view()); // 좌석이 없으면 버튼도 없다
+        expect(find.text('반납하기'), findsNothing);
+        expect(find.text('배정 취소하기'), findsNothing);
+      });
+
+      testWidgets('누르면 한 번 더 묻고, "아니요"면 반납하지 않는다', (tester) async {
+        final asked = <MyCharge>[];
+        await pump(tester, load: () async => [_charge()], v: view(), onReturn: (c) async {
+          asked.add(c);
+          return null;
+        });
+        await tester.tap(find.text('반납하기'));
+        await tester.pumpAndSettle();
+        expect(find.text('좌석을 반납할까요?'), findsOneWidget);
+        expect(find.textContaining('다시 앉으려면 새로 예약해야 해요'.keepWords), findsOneWidget);
+        await tester.tap(find.text('아니요'));
+        await tester.pumpAndSettle();
+        expect(find.text('좌석을 반납할까요?'), findsNothing);
+        expect(asked, isEmpty);
+        expect(find.text('반납하기'), findsOneWidget); // 그대로
+      });
+
+      testWidgets('이용 시작 전 좌석은 "배정 취소"로 묻는다', (tester) async {
+        await pump(tester, load: () async => [_charge(inUse: false)], v: view());
+        await tester.tap(find.text('배정 취소하기'));
+        await tester.pumpAndSettle();
+        expect(find.text('좌석 배정을 취소할까요?'), findsOneWidget);
+        expect(find.widgetWithText(TextButton, '배정 취소'), findsOneWidget);
+      });
+
+      testWidgets('확인하면 그 좌석으로 반납을 요청하고, 성공하면 목록을 다시 읽어 좌석이 없다고 보여 준다', (tester) async {
+        final asked = <MyCharge>[];
+        var returned = false;
+        var loads = 0;
+        Future<List<MyCharge>> load() async {
+          loads++;
+          return returned ? [] : [_charge()];
+        }
+
+        await pump(tester, load: load, v: view(), onReturn: (c) async {
+          asked.add(c);
+          returned = true;
+          return null;
+        });
+        expect(loads, 1);
+        await tester.tap(find.text('반납하기'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(TextButton, '반납'));
+        await tester.pumpAndSettle();
+
+        expect(asked.single.id, 900);
+        expect(asked.single.returnable, isTrue);
+        expect(loads, 2, reason: '반납한 뒤 목록을 다시 읽는다');
+        expect(find.text('지금 갖고 있는 좌석이 없어요.'), findsOneWidget);
+        expect(find.text('반납하기'), findsNothing);
+      });
+
+      testWidgets('실패하면 이유를 보여 주고 좌석은 그대로 두며, 다시 시도할 수 있다', (tester) async {
+        var loads = 0;
+        var tries = 0;
+        await pump(tester, load: () async {
+          loads++;
+          return [_charge()];
+        }, v: view(), onReturn: (c) async {
+          tries++;
+          return '반납하지 못했어요. error.x 이용 중인 좌석이 아니에요';
+        });
+        await tester.tap(find.text('반납하기'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(TextButton, '반납'));
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('이용 중인 좌석이 아니에요'.keepWords), findsOneWidget);
+        expect(find.text('반납하기'), findsOneWidget); // 다시 누를 수 있다
+        expect(loads, 1, reason: '실패했으면 목록을 다시 읽지 않는다');
+
+        await tester.tap(find.text('반납하기'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(TextButton, '반납'));
+        await tester.pumpAndSettle();
+        expect(tries, 2);
+      });
+
+      testWidgets('요청하는 동안에는 "반납하는 중…"으로 바뀌고 다시 누를 수 없다', (tester) async {
+        final gate = Completer<String?>();
+        await pump(tester, load: () async => [_charge()], v: view(), onReturn: (c) => gate.future);
+        await tester.tap(find.text('반납하기'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(TextButton, '반납'));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(find.text('반납하는 중…'), findsOneWidget);
+        final button = find.ancestor(of: find.text('반납하는 중…'), matching: find.bySubtype<OutlinedButton>());
+        expect(tester.widget<OutlinedButton>(button).onPressed, isNull);
+
+        gate.complete('반납하지 못했어요.');
+        await tester.pumpAndSettle();
+        expect(find.text('반납하기'), findsOneWidget);
+      });
     });
   });
 }

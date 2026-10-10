@@ -1,4 +1,4 @@
-import 'dart:io' show File, Platform;
+import 'dart:io' show File, Platform, exit;
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
@@ -13,6 +13,10 @@ import 'reservation_runner.dart';
 import 'run_state.dart';
 import 'seat_layout.dart';
 import 'update_check.dart';
+import 'windows_installer.dart';
+
+/// 진행 기록 파일. 앱 전용 폴더에 있어서 껐다 켜도 남는다 (Windows 업데이트 도우미도 여기에 결과를 덧붙인다).
+Future<File> runLogFile() async => File('${(await getApplicationSupportDirectory()).path}${Platform.pathSeparator}run_log.txt');
 
 /// 계정 정보를 기기 안에 암호화해서 보관하는 곳.
 abstract class SecureStore {
@@ -76,6 +80,8 @@ class AppServices {
     this.policyFor = _defaultPolicy,
     this.renewPolicy = const RenewPolicy(),
     this.logStore = const NoLogStore(),
+    this.installer,
+    this.quit = _quit,
     this.wrapRoot = _identity,
     this.desktop = false,
     this.openUrl = openInBrowser,
@@ -83,14 +89,19 @@ class AppServices {
 
   factory AppServices.real() {
     final desktop = runsOnDesktop;
+    final updater = UpdateChecker();
     return AppServices(
       newApi: LibApi.new,
       background: desktop ? DesktopBackgroundService() : AndroidBackgroundService(),
       notifier: LocalResultNotifier(),
       secure: DeviceSecureStore(),
-      updater: UpdateChecker(),
+      updater: updater,
       // 진행 기록은 앱 전용 폴더의 파일에 저장해서, 앱을 껐다 켜도 지난 기록을 볼 수 있다.
-      logStore: FileLogStore(() async => File('${(await getApplicationSupportDirectory()).path}/run_log.txt')),
+      logStore: FileLogStore(runLogFile),
+      // 앱 안에서 스스로 새 버전으로 바뀌는 것은 Windows 만 한다 (맥은 서명이 없는 앱이라 다운로드 페이지를 연다).
+      installer: desktop && Platform.isWindows
+          ? WindowsInstaller(checker: updater, tempDir: getTemporaryDirectory, logFile: runLogFile)
+          : null,
       // 뒤로 가기로 앱을 내리는 플러그인 위젯은 안드로이드 전용이다.
       wrapRoot: desktop ? _identity : (child) => WithForegroundTask(child: child),
       desktop: desktop,
@@ -116,6 +127,12 @@ class AppServices {
   /// 진행 기록을 보관하는 곳. 시험에서는 저장하지 않는다.
   final LogStore logStore;
 
+  /// 앱이 스스로 새 버전으로 바뀌게 하는 것 (Windows 만). 없으면 업데이트는 다운로드 페이지를 여는 방식이다.
+  final AppInstaller? installer;
+
+  /// 앱을 끝낸다. 새 버전으로 바뀌는 도우미를 띄운 뒤에 부른다. 시험에서는 부른 것만 기록한다.
+  final Future<void> Function() quit;
+
   /// 맨 위 위젯을 감싼다. 실제 앱에서는 뒤로 가기 때 앱을 닫지 않고 내려 주는 플러그인 위젯을 씌운다.
   final Widget Function(Widget child) wrapRoot;
 
@@ -126,6 +143,7 @@ class AppServices {
   /// 웹 주소를 기본 브라우저로 연다 (컴퓨터용 업데이트 안내). 열었으면 true.
   final Future<bool> Function(String url) openUrl;
 
+  static Future<void> _quit() async => exit(0);
   static Future<SeatLayout?> _defaultLayout(int room) => SeatLayout.load(room);
   static RunPolicy _defaultPolicy(Duration interval) => RunPolicy(interval: interval);
   static Widget _identity(Widget child) => child;

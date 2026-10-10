@@ -97,6 +97,31 @@ void main() {
       ]);
       expect(parseRelease(j)!.apkName, 'ssu-lib-seat-1.0.3.apk');
     });
+    test('Windows 용 압축 파일 정보도 뽑는다 (이름, 주소, 크기, 해시)', () {
+      final j = _release(assets: [
+        {'name': 'ssu-lib-seat-1.0.3.apk', 'browser_download_url': 'https://x/a.apk', 'size': 5},
+        {'name': 'ssu-lib-seat-1.0.3-macos.zip', 'browser_download_url': 'https://x/m.zip', 'size': 7},
+        {
+          'name': 'ssu-lib-seat-1.0.3-windows.zip',
+          'browser_download_url': 'https://x/w.zip',
+          'size': 9,
+          'digest': 'sha256:BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD',
+        },
+      ]);
+      final u = parseRelease(j)!;
+      expect(u.hasWindowsZip, isTrue);
+      expect(u.windowsName, 'ssu-lib-seat-1.0.3-windows.zip');
+      expect(u.windowsUrl, 'https://x/w.zip'); // macOS zip 이 아니라 Windows zip
+      expect(u.windowsSize, 9);
+      expect(u.windowsSha256, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+    });
+    test('Windows 파일이 없는 릴리스는 hasWindowsZip 이 false 다 (APK 는 그대로 읽는다)', () {
+      final u = parseRelease(_release())!;
+      expect(u.hasWindowsZip, isFalse);
+      expect(u.windowsUrl, '');
+      expect(u.windowsSha256, isNull);
+      expect(u.apkName, 'ssu-lib-seat-1.0.3.apk');
+    });
     test('초안, 시험판, APK 없음은 null', () {
       expect(parseRelease(_release(draft: true)), isNull);
       expect(parseRelease(_release(prerelease: true)), isNull);
@@ -164,6 +189,51 @@ void main() {
       final c = _checker(_FakeAdapter((_) => ResponseBody.fromBytes(utf8.encode('xyz'), 200)));
       await expectLater(c.download(parseRelease(_release())!, dir.path), throwsA(isA<UpdateException>()));
       expect(dir.listSync(), isEmpty);
+    });
+
+    test('downloadWindows: 받아서 검증하고, 같은 파일은 다시 받지 않고, 지난 Windows 파일만 정리한다', () async {
+      final adapter = _FakeAdapter((_) => ResponseBody.fromBytes(utf8.encode('abc'), 200, headers: {
+            Headers.contentLengthHeader: ['3'],
+          }));
+      final c = _checker(adapter);
+      final u = parseRelease(_release(assets: [
+        {'name': 'ssu-lib-seat-1.0.3.apk', 'browser_download_url': 'https://x/a.apk', 'size': 3},
+        {
+          'name': 'ssu-lib-seat-1.0.3-windows.zip',
+          'browser_download_url': 'https://x/w.zip',
+          'size': 3,
+          'digest': 'sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+        },
+      ]))!;
+      final oldZip = File('${dir.path}/ssu-lib-seat-1.0.1-windows.zip')..writeAsStringSync('old');
+      final apk = File('${dir.path}/ssu-lib-seat-1.0.1.apk')..writeAsStringSync('apk');
+      final progress = <double>[];
+      final f = await c.downloadWindows(u, dir.path, onProgress: progress.add);
+      expect(f.path, endsWith('ssu-lib-seat-1.0.3-windows.zip'));
+      expect(await f.readAsString(), 'abc');
+      expect(progress.last, 1.0);
+      expect(oldZip.existsSync(), isFalse);
+      expect(apk.existsSync(), isTrue, reason: 'APK 는 건드리지 않는다');
+      expect(await windowsZipMatches(f, u), isTrue);
+
+      await c.downloadWindows(u, dir.path);
+      expect(adapter.calls, 1); // 이미 검증된 파일이라 네트워크를 쓰지 않는다
+    });
+
+    test('downloadWindows: 내용이 다르면 실패하고, Windows 파일이 없는 릴리스는 거부한다', () async {
+      final u = parseRelease(_release(assets: [
+        {'name': 'ssu-lib-seat-1.0.3.apk', 'browser_download_url': 'https://x/a.apk', 'size': 3},
+        {
+          'name': 'ssu-lib-seat-1.0.3-windows.zip',
+          'browser_download_url': 'https://x/w.zip',
+          'size': 3,
+          'digest': 'sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+        },
+      ]))!;
+      final c = _checker(_FakeAdapter((_) => ResponseBody.fromBytes(utf8.encode('xyz'), 200)));
+      await expectLater(c.downloadWindows(u, dir.path), throwsA(isA<UpdateException>()));
+      expect(dir.listSync(), isEmpty);
+      await expectLater(c.downloadWindows(parseRelease(_release())!, dir.path), throwsA(isA<UpdateException>()));
     });
 
     test('download: 지난 버전 APK 는 정리한다', () async {

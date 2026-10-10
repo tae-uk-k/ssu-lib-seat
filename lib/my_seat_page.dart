@@ -59,6 +59,7 @@ class MySeatPage extends StatefulWidget {
     required this.onToggle,
     required this.onStart,
     required this.onLogin,
+    required this.onReturn,
   });
 
   final bool loggedIn;
@@ -76,6 +77,9 @@ class MySeatPage extends StatefulWidget {
   /// 로그인한다 (로그인이 안 돼 있을 때 보이는 버튼).
   final Future<void> Function() onLogin;
 
+  /// 이 좌석을 반납한다 (이용 시작 전이면 배정 취소). 성공하면 null, 실패하면 사용자에게 보일 이유.
+  final Future<String?> Function(MyCharge seat) onReturn;
+
   @override
   State<MySeatPage> createState() => _MySeatPageState();
 }
@@ -85,6 +89,8 @@ class _MySeatPageState extends State<MySeatPage> {
   DateTime? _at; // _charges 를 확인한 시각
   Object? _error;
   bool _loading = false;
+  int? _returningId; // 반납을 요청하고 기다리는 중인 좌석 (예약 번호)
+  String? _returnError; // 마지막 반납 시도가 실패한 이유
 
   @override
   void initState() {
@@ -123,6 +129,44 @@ class _MySeatPageState extends State<MySeatPage> {
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+  }
+
+  /// 되돌릴 수 없는 일이라 한 번 더 묻고, 확인하면 반납한다. 성공하면 목록을 다시 읽어 온다.
+  Future<void> _confirmReturn(MyCharge c) async {
+    final inUse = c.returnable;
+    final label = c.roomName.isEmpty ? '${c.seatCode}번 좌석' : '${c.roomName} ${c.seatCode}번 좌석';
+    final scheme = Theme.of(context).colorScheme;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: Text(inUse ? '좌석을 반납할까요?' : '좌석 배정을 취소할까요?'),
+        content: Text(
+            (inUse
+                    ? '$label을 반납하면 더 이상 쓸 수 없고, 다시 앉으려면 새로 예약해야 해요. 자동 연장도 멈춰요.'
+                    : '$label 배정을 취소하면 이 좌석은 사라지고, 다시 앉으려면 새로 예약해야 해요. 자동 연장도 멈춰요.')
+                .keepWords),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('아니요')),
+          TextButton(
+            onPressed: () => Navigator.pop(d, true),
+            style: TextButton.styleFrom(foregroundColor: scheme.error),
+            child: Text(inUse ? '반납' : '배정 취소'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() {
+      _returningId = c.id;
+      _returnError = null;
+    });
+    final why = await widget.onReturn(c);
+    if (!mounted) return;
+    setState(() {
+      _returningId = null;
+      _returnError = why;
+    });
+    if (why == null) await _refresh(); // 반납됐으니 목록을 다시 읽어 "갖고 있는 좌석이 없어요"가 보이게
   }
 
   String _errorText(Object e) {
@@ -268,6 +312,27 @@ class _MySeatPageState extends State<MySeatPage> {
               padding: const EdgeInsets.only(top: 10),
               child: Text('배정만 된 상태예요. 이용을 시작하면 연장할 수 있어요.'.keepWords,
                   style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant)),
+            ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: _returningId != null || _loading ? null : () => _confirmReturn(c),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: scheme.error,
+                side: BorderSide(color: scheme.error.withValues(alpha: 0.5)),
+              ),
+              icon: _returningId == c.id
+                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.event_busy, size: 18),
+              label: Text(_returningId == c.id ? (inUse ? '반납하는 중…' : '취소하는 중…') : (inUse ? '반납하기' : '배정 취소하기')),
+            ),
+          ),
+          if (_returnError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(_returnError!.keepWords,
+                  style: TextStyle(fontSize: 12.5, height: 1.4, fontWeight: FontWeight.w600, color: scheme.error)),
             ),
         ]),
       ),

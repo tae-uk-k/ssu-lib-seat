@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:pointycastle/export.dart';
 
-// 앱 안 업데이트. GitHub 릴리스의 최신 APK 를 확인하고 내려받는다.
+// 앱 안 업데이트. GitHub 릴리스의 최신 APK(폰)와 Windows 압축 파일(컴퓨터)을 확인하고 내려받는다.
 // Flutter 에 의존하지 않아서 `dart run tools/check_update_live.dart` 로 PC 에서도 실제 서버로 시험할 수 있다.
 
 /// 릴리스를 올리는 공개 저장소.
@@ -26,6 +26,10 @@ class UpdateInfo {
     required this.sha256,
     required this.notes,
     this.pageUrl = '',
+    this.windowsName = '',
+    this.windowsUrl = '',
+    this.windowsSize = 0,
+    this.windowsSha256,
   });
 
   /// "1.0.3" (태그의 v 는 뗀 값)
@@ -40,6 +44,14 @@ class UpdateInfo {
 
   /// 이 릴리스의 웹 페이지 주소. 컴퓨터(Windows/macOS)용 앱은 APK 를 설치할 수 없어서, 이 페이지에서 내려받게 한다.
   final String pageUrl;
+
+  /// Windows 용 압축 파일(`ssu-lib-seat-X-windows.zip`). Windows 앱은 이걸 내려받아 스스로 새 버전으로 바뀐다. 릴리스에 없으면 빈 문자열.
+  final String windowsName;
+  final String windowsUrl;
+  final int windowsSize;
+  final String? windowsSha256;
+
+  bool get hasWindowsZip => windowsUrl.isNotEmpty;
 }
 
 /// "v1.0.12", "1.0.12+3" → [1, 0, 12]. 숫자가 아닌 조각을 만나면 거기서 멈춘다.
@@ -66,27 +78,41 @@ bool isNewerVersion(String current, String latest) {
   return false;
 }
 
-/// GitHub `releases/latest` 응답에서 APK 정보를 뽑는다. 초안/시험판이거나 APK 가 없으면 null.
+/// GitHub 가 계산해 준 파일 해시(`sha256:...`)를 소문자 16진수로. 없으면 null.
+String? _digestOf(Map a) {
+  final digest = a['digest'];
+  return digest is String && digest.startsWith('sha256:') ? digest.substring(7).toLowerCase() : null;
+}
+
+/// GitHub `releases/latest` 응답에서 APK 와 Windows 압축 파일 정보를 뽑는다. 초안/시험판이거나 APK 가 없으면 null.
+/// Windows 압축 파일은 없어도 된다 (그러면 [UpdateInfo.hasWindowsZip] 이 false).
 UpdateInfo? parseRelease(Map<String, dynamic> j) {
   if (j['draft'] == true || j['prerelease'] == true) return null;
   final tag = j['tag_name'];
   if (tag is! String || parseVersion(tag).isEmpty) return null;
+  Map? apk, win;
   for (final a in (j['assets'] as List?) ?? const []) {
     if (a is! Map) continue;
     final name = a['name'], url = a['browser_download_url'];
-    if (name is! String || url is! String || !name.toLowerCase().endsWith('.apk')) continue;
-    final digest = a['digest'];
-    return UpdateInfo(
-      version: tag.replaceFirst(RegExp(r'^[vV]'), ''),
-      apkName: name,
-      apkUrl: url,
-      apkSize: (a['size'] as num?)?.toInt() ?? 0,
-      sha256: digest is String && digest.startsWith('sha256:') ? digest.substring(7).toLowerCase() : null,
-      notes: ((j['body'] as String?) ?? '').trim(),
-      pageUrl: (j['html_url'] as String?) ?? '',
-    );
+    if (name is! String || url is! String) continue;
+    final n = name.toLowerCase();
+    if (apk == null && n.endsWith('.apk')) apk = a;
+    if (win == null && n.endsWith('-windows.zip')) win = a;
   }
-  return null;
+  if (apk == null) return null;
+  return UpdateInfo(
+    version: tag.replaceFirst(RegExp(r'^[vV]'), ''),
+    apkName: apk['name'] as String,
+    apkUrl: apk['browser_download_url'] as String,
+    apkSize: (apk['size'] as num?)?.toInt() ?? 0,
+    sha256: _digestOf(apk),
+    notes: ((j['body'] as String?) ?? '').trim(),
+    pageUrl: (j['html_url'] as String?) ?? '',
+    windowsName: win == null ? '' : win['name'] as String,
+    windowsUrl: win == null ? '' : win['browser_download_url'] as String,
+    windowsSize: win == null ? 0 : (win['size'] as num?)?.toInt() ?? 0,
+    windowsSha256: win == null ? null : _digestOf(win),
+  );
 }
 
 Future<String> sha256OfFile(File f) async {
@@ -99,14 +125,19 @@ Future<String> sha256OfFile(File f) async {
   return out.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 }
 
-/// 내려받은 APK 가 릴리스에 올라간 파일과 같은지 크기와 해시로 확인한다. 다르면 false.
-Future<bool> apkMatches(File f, UpdateInfo u) async {
+/// 내려받은 파일이 릴리스에 올라간 파일과 같은지 크기와 해시로 확인한다. 다르면 false.
+Future<bool> fileMatches(File f, {required int size, required String? sha256}) async {
   if (!await f.exists()) return false;
-  if (u.apkSize > 0 && await f.length() != u.apkSize) return false;
-  final want = u.sha256;
-  if (want != null && await sha256OfFile(f) != want) return false;
+  if (size > 0 && await f.length() != size) return false;
+  if (sha256 != null && await sha256OfFile(f) != sha256) return false;
   return true;
 }
+
+/// 내려받은 APK 가 릴리스에 올라간 파일과 같은지 확인한다.
+Future<bool> apkMatches(File f, UpdateInfo u) => fileMatches(f, size: u.apkSize, sha256: u.sha256);
+
+/// 내려받은 Windows 압축 파일이 릴리스에 올라간 파일과 같은지 확인한다.
+Future<bool> windowsZipMatches(File f, UpdateInfo u) => fileMatches(f, size: u.windowsSize, sha256: u.windowsSha256);
 
 class UpdateChecker {
   UpdateChecker({Dio? dio, this.repo = updateRepo})
@@ -138,14 +169,46 @@ class UpdateChecker {
 
   /// APK 를 [dir] 에 내려받아 검증하고 돌려준다. 이미 받아 둔 같은 파일이 있으면 다시 받지 않는다.
   /// [onProgress] 는 0~1.
-  Future<File> download(UpdateInfo u, String dir, {void Function(double)? onProgress}) async {
-    final target = File('$dir${Platform.pathSeparator}ssu-lib-seat-${u.version}.apk');
-    if (await apkMatches(target, u)) return target;
+  Future<File> download(UpdateInfo u, String dir, {void Function(double)? onProgress}) => _fetch(
+        dir: dir,
+        fileName: 'ssu-lib-seat-${u.version}.apk',
+        suffix: '.apk',
+        url: u.apkUrl,
+        size: u.apkSize,
+        sha256: u.sha256,
+        onProgress: onProgress,
+      );
 
-    // 지난 버전 파일은 정리한다.
+  /// Windows 압축 파일을 [dir] 에 내려받아 검증하고 돌려준다 ([download] 와 같은 규칙). 릴리스에 없으면 [UpdateException].
+  Future<File> downloadWindows(UpdateInfo u, String dir, {void Function(double)? onProgress}) async {
+    if (!u.hasWindowsZip) throw UpdateException('이 릴리스에는 Windows 용 파일이 없어요.');
+    return _fetch(
+      dir: dir,
+      fileName: 'ssu-lib-seat-${u.version}-windows.zip',
+      suffix: '-windows.zip',
+      url: u.windowsUrl,
+      size: u.windowsSize,
+      sha256: u.windowsSha256,
+      onProgress: onProgress,
+    );
+  }
+
+  Future<File> _fetch({
+    required String dir,
+    required String fileName,
+    required String suffix,
+    required String url,
+    required int size,
+    required String? sha256,
+    void Function(double)? onProgress,
+  }) async {
+    final target = File('$dir${Platform.pathSeparator}$fileName');
+    if (await fileMatches(target, size: size, sha256: sha256)) return target;
+
+    // 지난 버전 파일은 정리한다 (같은 종류만).
     for (final e in Directory(dir).listSync()) {
       final n = e.uri.pathSegments.isEmpty ? '' : e.uri.pathSegments.last;
-      if (e is File && n.startsWith('ssu-lib-seat-') && n.endsWith('.apk')) {
+      if (e is File && n.startsWith('ssu-lib-seat-') && n.endsWith(suffix)) {
         try {
           await e.delete();
         } catch (_) {}
@@ -154,10 +217,10 @@ class UpdateChecker {
     final part = File('${target.path}.part');
     try {
       await _dio.download(
-        u.apkUrl,
+        url,
         part.path,
         onReceiveProgress: (got, total) {
-          final t = total > 0 ? total : u.apkSize;
+          final t = total > 0 ? total : size;
           if (t > 0) onProgress?.call((got / t).clamp(0.0, 1.0));
         },
       );
@@ -166,7 +229,7 @@ class UpdateChecker {
       throw UpdateException('내려받는 중 연결이 끊겼어요. 다시 시도해 주세요.');
     }
     await part.rename(target.path);
-    if (!await apkMatches(target, u)) {
+    if (!await fileMatches(target, size: size, sha256: sha256)) {
       await target.delete();
       throw UpdateException('내려받은 파일이 올바르지 않아요. 다시 시도해 주세요.');
     }

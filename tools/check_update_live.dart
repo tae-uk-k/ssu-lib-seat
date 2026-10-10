@@ -18,6 +18,9 @@ Future<void> main(List<String> args) async {
   say('최신 버전 : ${info.version}');
   say('APK       : ${info.apkName} (${info.apkSize} bytes)');
   say('SHA-256   : ${info.sha256 ?? '(GitHub 가 해시를 주지 않음)'}');
+  say(info.hasWindowsZip
+      ? 'Windows   : ${info.windowsName} (${info.windowsSize} bytes, SHA-256 ${info.windowsSha256 ?? '없음'}) -> Windows 앱이 스스로 업데이트할 수 있어요'
+      : 'Windows   : (이 릴리스에는 Windows 용 파일이 없어요 -> Windows 앱은 다운로드 페이지를 열어요)');
   say('변경 내용 : ${info.notes.isEmpty ? '(없음)' : info.notes}');
   for (final cur in ['1.0.0', info.version]) {
     say('현재 $cur 이면 업데이트 안내: ${isNewerVersion(cur, info.version)}');
@@ -34,6 +37,10 @@ Future<void> main(List<String> args) async {
         }
       });
       say('내려받아 검증 완료: ${f.path} (${await f.length()} bytes)');
+      if (info.hasWindowsZip) {
+        final w = await checker.downloadWindows(info, dir.path);
+        say('Windows 파일도 내려받아 검증 완료: ${w.path} (${await w.length()} bytes)');
+      }
     } finally {
       dir.deleteSync(recursive: true);
     }

@@ -17,6 +17,7 @@ import 'package:lib_seat/run_state.dart';
 import 'package:lib_seat/seat_layout.dart';
 import 'package:lib_seat/services.dart';
 import 'package:lib_seat/update_check.dart';
+import 'package:lib_seat/windows_installer.dart';
 import 'package:lib_seat/widgets.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -94,18 +95,33 @@ class FakeLibrary implements LibraryApi {
     return List.of(held);
   }
 
+  /// 반납·취소 요청에 차례로 돌려줄 응답 (비면 성공). 성공하면 내 좌석에서 사라진다.
+  final releaseScript = <Map<String, dynamic>>[];
+
+  /// 다음 반납·취소 요청 한 번에 던질 오류 (연결이 끊긴 상황).
+  Exception? releaseFailureOnce;
+
+  Map<String, dynamic> _release(int chargeId) {
+    final failure = releaseFailureOnce;
+    if (failure != null) {
+      releaseFailureOnce = null;
+      throw failure;
+    }
+    final res = releaseScript.isEmpty ? <String, dynamic>{'success': true} : releaseScript.removeAt(0);
+    if (res['success'] == true) held.removeWhere((c) => c.id == chargeId);
+    return res;
+  }
+
   @override
   Future<Map<String, dynamic>> cancelCharge(int chargeId) async {
     calls.add('cancel:$chargeId');
-    held.removeWhere((c) => c.id == chargeId);
-    return {'success': true};
+    return _release(chargeId);
   }
 
   @override
   Future<Map<String, dynamic>> returnCharge(int chargeId) async {
     calls.add('return:$chargeId');
-    held.removeWhere((c) => c.id == chargeId);
-    return {'success': true};
+    return _release(chargeId);
   }
 
   @override
@@ -147,6 +163,9 @@ class FakeBackground implements BackgroundService {
   /// 있으면 stop() 이 이 Completer 가 끝날 때까지 기다린다 ("멈추는 중" 상태를 눈으로 확인하려고).
   Completer<void>? stopGate;
 
+  /// 있으면 start() 가 이 Completer 가 끝날 때까지 기다린다 ("시작하는 중" 상태를 눈으로 확인하려고).
+  Completer<void>? startGate;
+
   @override
   Future<void> init() async => inits++;
   @override
@@ -154,6 +173,8 @@ class FakeBackground implements BackgroundService {
   @override
   Future<bool> start({required String title, required String text}) async {
     starts++;
+    final g = startGate;
+    if (g != null) await g.future;
     return startOk;
   }
 
@@ -184,6 +205,24 @@ class FakeNotifier implements ResultNotifier {
   Future<void> init() async {}
   @override
   Future<void> show({required String title, required String body}) async => shown.add('$title | $body');
+}
+
+/// 앱 안에서 스스로 새 버전으로 바뀌는 것(Windows)을 흉내 낸다.
+class FakeInstaller implements AppInstaller {
+  bool can = true;
+  Object? failure;
+  final installed = <String>[];
+
+  @override
+  Future<bool> canInstall(UpdateInfo u) async => can;
+
+  @override
+  Future<void> installAndRestart(UpdateInfo u, {required String oldVersion, void Function(double)? onProgress}) async {
+    onProgress?.call(0.5);
+    final f = failure;
+    if (f != null) throw f;
+    installed.add('${u.version} from $oldVersion');
+  }
 }
 
 /// 저장된 기록을 흉내 낸다 (앱을 껐다 켜도 남는지 시험한다).
@@ -250,6 +289,7 @@ class Rig {
     FakeBackground? bg,
     FakeNotifier? notifier,
     MemoryLogStore? logStore,
+    this.installer,
     this.desktop = false,
     this.newRelease = false,
     this.withMap = false,
@@ -263,6 +303,12 @@ class Rig {
   final FakeNotifier notifier;
   final MemoryLogStore logStore;
   final store = MemoryStore();
+
+  /// 앱 안에서 스스로 새 버전으로 바뀌는 것 (없으면 다운로드 페이지를 여는 방식).
+  final FakeInstaller? installer;
+
+  /// 앱을 끝내라고 한 횟수.
+  int quits = 0;
 
   /// 컴퓨터(Windows/macOS)용 동작으로 시험한다.
   final bool desktop;
@@ -289,6 +335,8 @@ class Rig {
         },
         layoutFor: (room) async => withMap && room == 53 ? _layout53 : null,
         logStore: logStore,
+        installer: installer,
+        quit: () async => quits++,
         // 자동 연장 시간표도 시험용으로 아주 짧게 (문턱 30분은 그대로)
         renewPolicy: const RenewPolicy(
           retryAfter: Duration(milliseconds: 60),
@@ -1158,13 +1206,13 @@ void main() {
 
   // ---------- 자동 연장 ----------
 
-  MyCharge mine({int remaining = 20, String code = '5', bool? renewable = true, List<String> methods = const []}) => MyCharge(
+  MyCharge mine({int remaining = 20, String code = '5', bool? renewable = true, List<String> methods = const [], bool inUse = true}) => MyCharge(
         id: 900,
         seatId: 105,
         seatCode: code,
         roomId: 53,
         roomName: '숭실스퀘어ON(2F)',
-        returnable: true,
+        returnable: inUse,
         remainingMinutes: remaining,
         renewable: renewable,
         arrivalMethods: methods,
@@ -1353,6 +1401,91 @@ void main() {
     expect(find.text('중지하기'), findsNothing);
     expect(rig.bg.stops, 1);
     expect(api.calls, isEmpty);
+  });
+
+  // ---------- Windows 앱 안 업데이트 ----------
+
+  testWidgets('Windows: 스스로 업데이트할 수 있으면 폰처럼 "업데이트" 버튼이 나오고, 누르면 바꾸고 앱을 끝낸다', (tester) async {
+    final inst = FakeInstaller();
+    final rig = Rig(desktop: true, newRelease: true, installer: inst);
+    await _pumpApp(tester, rig);
+    await _settle(tester, ms: 100);
+    expect(find.text('새 버전 1.0.9이 나왔어요'), findsOneWidget);
+    expect(find.text('업데이트'), findsOneWidget);
+    expect(find.text('다운로드 페이지 열기'), findsNothing); // 페이지를 여는 방식이 아니다
+
+    await tester.tap(find.text('업데이트'));
+    await _settle(tester, ms: 200);
+    expect(inst.installed, ['1.0.9 from 1.0.1']);
+    expect(rig.quits, 1); // 도우미가 파일을 바꾸도록 앱을 끝낸다
+    expect(rig.openedUrls, isEmpty);
+    await _openLog(tester);
+    expect(find.textContaining('새 버전 1.0.9 을 내려받아요'), findsOneWidget);
+    expect(find.textContaining('앱 안에서 바로 업데이트할 수 있어요'), findsOneWidget);
+    expect(find.textContaining('앱을 종료해요'), findsOneWidget);
+  });
+
+  testWidgets('Windows: 예약이 도는 중에는 업데이트할 수 없다고 막는다 (앱이 끝나면 예약도 멈추니까)', (tester) async {
+    final inst = FakeInstaller();
+    final rig = Rig(api: FakeLibrary(script: [_seats()]), desktop: true, newRelease: true, installer: inst);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5']);
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: 300);
+    expect(find.textContaining('예약을 멈춘 뒤에 업데이트할 수 있어요'.keepWords), findsOneWidget);
+    // FilledButton.icon 은 내부적으로 FilledButton 의 하위 종류라서 하위 종류까지 찾는다.
+    final button = find.ancestor(of: find.text('업데이트'), matching: find.bySubtype<FilledButton>());
+    expect(tester.widget<FilledButton>(button).onPressed, isNull);
+    expect(inst.installed, isEmpty);
+    expect(rig.quits, 0);
+    await tester.tap(find.text('중지하기'));
+    await _settle(tester, ms: 200);
+  });
+
+  testWidgets('Windows: 앱 폴더에 쓸 수 없는 등 스스로 못 바꾸면 지금처럼 다운로드 페이지를 연다', (tester) async {
+    final inst = FakeInstaller()..can = false;
+    final rig = Rig(desktop: true, newRelease: true, installer: inst);
+    await _pumpApp(tester, rig);
+    await _settle(tester, ms: 100);
+    expect(find.text('다운로드 페이지 열기'), findsOneWidget);
+    expect(find.text('업데이트'), findsNothing);
+    await tester.tap(find.text('다운로드 페이지 열기'));
+    await _settle(tester, ms: 100);
+    expect(rig.openedUrls, ['https://github.com/tae-uk-k/ssu-lib-seat/releases/tag/v1.0.9']);
+    expect(inst.installed, isEmpty);
+  });
+
+  testWidgets('Windows: 스스로 바꾸다 실패하면 알리고, 앱을 끝내지 않고, 다운로드 페이지를 여는 방식으로 돌아간다', (tester) async {
+    final inst = FakeInstaller()..failure = UpdateException('내려받은 파일이 올바르지 않아요. 다시 시도해 주세요.');
+    final rig = Rig(desktop: true, newRelease: true, installer: inst);
+    await _pumpApp(tester, rig);
+    await _settle(tester, ms: 100);
+    await tester.tap(find.text('업데이트'));
+    await _settle(tester, ms: 200);
+    expect(find.textContaining('내려받은 파일이 올바르지 않아요'), findsWidgets);
+    expect(find.textContaining('다운로드 페이지에서 직접 받아 주세요'), findsOneWidget);
+    expect(rig.quits, 0);
+    expect(find.text('다운로드 페이지 열기'), findsOneWidget); // 이제 페이지를 여는 버튼
+    expect(find.text('업데이트'), findsNothing);
+  });
+
+  testWidgets('맥(설치 도우미 없음)은 예전처럼 다운로드 페이지를 연다', (tester) async {
+    final rig = Rig(desktop: true, newRelease: true); // installer 없음
+    await _pumpApp(tester, rig);
+    await _settle(tester, ms: 100);
+    expect(find.text('다운로드 페이지 열기'), findsOneWidget);
+    expect(find.text('업데이트'), findsNothing);
+  });
+
+  testWidgets('폰은 설치 도우미가 있어도(있을 리 없지만) 컴퓨터용 방식을 쓰지 않는다', (tester) async {
+    final inst = FakeInstaller();
+    final rig = Rig(newRelease: true, installer: inst); // desktop: false
+    await _pumpApp(tester, rig);
+    await _settle(tester, ms: 100);
+    expect(find.text('업데이트'), findsOneWidget);
+    expect(inst.installed, isEmpty);
+    expect(rig.quits, 0);
   });
 
   // ---------- 내 좌석 화면 ----------
@@ -1581,6 +1714,177 @@ void main() {
     expect(find.text('자동 연장 켜짐 · 시작하면 함께 동작해요'), findsNothing); // 도는 동안에는 배너가 대신한다
     await tester.tap(find.text('중지하기'));
     await _settle(tester, ms: 300);
+  });
+
+  testWidgets('자동 연장만 시작하는 중에는 "예약을 시작한다"고 하지 않고 자동 연장이 켜져 있다고 보여 준다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100)]);
+    final rig = Rig(api: api);
+    rig.bg.startGate = Completer<void>(); // 서비스가 뜨기를 기다리는 동안 "시작하는 중" 화면이 유지된다
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await tester.tap(find.text('자동 연장만 시작'));
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.text('시작하는 중…'), findsOneWidget);
+    expect(find.text('자동 연장을 시작하는 중이에요'), findsOneWidget);
+    expect(find.text('예약을 시작하는 중이에요'), findsNothing);
+    expect(find.text('첫 확인을 기다리는 중…'), findsNothing); // 빈 좌석을 찾는 얘기도 하지 않는다
+    expect(find.text('자동 연장 꺼짐'), findsNothing);
+    expect(find.text('자동 연장 켜짐'), findsOneWidget);
+    expect(find.text('예약 시작'), findsNothing); // 4단계 제목도 "자동 연장 시작"
+    expect(find.text('자동 연장 시작'), findsOneWidget);
+
+    rig.bg.startGate!.complete();
+    await _settle(tester, ms: 300);
+    expect(find.text('자동 연장을 지켜보는 중이에요'), findsOneWidget);
+    expect(find.text('자동 연장 시작'), findsOneWidget);
+    await tester.tap(find.text('중지하기'));
+    await _settle(tester, ms: 300);
+  });
+
+  testWidgets('좌석을 골라 예약을 시작하는 중에는 "예약을 시작하는 중"이라고 하고, 자동 연장은 켜져 있다고 보여 준다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final rig = Rig(api: FakeLibrary(script: [_seats()]));
+    rig.bg.startGate = Completer<void>();
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['8']);
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.text('예약을 시작하는 중이에요'), findsOneWidget);
+    expect(find.text('자동 연장을 시작하는 중이에요'), findsNothing);
+    expect(find.text('자동 연장 켜짐'), findsOneWidget); // 아직 연장 루프가 없는 시작 단계여도 "꺼짐"이라고 하지 않는다
+    expect(find.text('자동 연장 꺼짐'), findsNothing);
+    expect(find.text('예약 시작'), findsOneWidget); // 4단계 제목은 그대로 "예약 시작"
+
+    rig.bg.startGate!.complete();
+    await _settle(tester, ms: 300);
+    await tester.tap(find.text('중지하기'));
+    await _settle(tester, ms: 300);
+  });
+
+  // ---------- 반납 ----------
+
+  /// 내 좌석 화면에서 "반납하기"(또는 [button])를 누르고 확인 창에서 [confirm] 을 누른다.
+  Future<void> returnFromMySeat(WidgetTester tester, {String button = '반납하기', String confirm = '반납', bool running = false}) async {
+    await tester.tap(find.text(button));
+    await (running ? _settle(tester, ms: 200) : _settleAnim(tester));
+    await tester.tap(find.widgetWithText(TextButton, confirm));
+    await (running ? _settle(tester, ms: 800) : _settleAnim(tester));
+  }
+
+  testWidgets('내 좌석 화면에서 반납하면 서버에 반납을 요청하고, 좌석이 없다고 보이고, 기록이 남는다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    await returnFromMySeat(tester);
+
+    expect(api.calls, ['return:900']); // 이용 중인 좌석은 반납(취소가 아니다)
+    expect(find.text('지금 갖고 있는 좌석이 없어요.'), findsOneWidget);
+    expect(find.textContaining('5번 좌석을 반납했어요'), findsOneWidget);
+    expect(rig.logStore.lines.any((l) => l.contains('5번 좌석 반납 완료')), isTrue);
+  });
+
+  testWidgets('이용 시작 전(배정만 된) 좌석은 취소 요청을 보낸다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100, renewable: false, inUse: false)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    expect(find.text('반납하기'), findsNothing);
+    await returnFromMySeat(tester, button: '배정 취소하기', confirm: '배정 취소');
+
+    expect(api.calls, ['cancel:900']);
+    expect(find.text('지금 갖고 있는 좌석이 없어요.'), findsOneWidget);
+    expect(find.textContaining('5번 좌석 배정을 취소했어요'), findsOneWidget);
+  });
+
+  testWidgets('확인 창에서 "아니요"를 누르면 서버에 아무것도 보내지 않는다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    await tester.tap(find.text('반납하기'));
+    await _settleAnim(tester);
+    await tester.tap(find.text('아니요'));
+    await _settleAnim(tester);
+    expect(api.calls, isEmpty);
+    expect(find.text('반납하기'), findsOneWidget);
+  });
+
+  testWidgets('서버가 거절하면 이유를 보여 주고 좌석은 그대로다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100)])
+      ..releaseScript.add({'success': false, 'code': 'error.x', 'message': '이용 중인 좌석이 아니에요'});
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    await returnFromMySeat(tester);
+
+    expect(find.textContaining('반납하지 못했어요. error.x 이용 중인 좌석이 아니에요'.keepWords), findsOneWidget);
+    expect(find.text('반납하기'), findsOneWidget); // 좌석이 그대로 있고 다시 시도할 수 있다
+    expect(find.textContaining('반납했어요'), findsNothing);
+    expect(rig.logStore.lines.any((l) => l.contains('반납 실패: error.x 이용 중인 좌석이 아니에요')), isTrue);
+  });
+
+  testWidgets('연결이 끊기면 처리됐을 수도 있다고 알려 주고, 새로고침으로 확인할 수 있다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100)])..releaseFailureOnce = TimeoutException('느려요');
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    await returnFromMySeat(tester);
+
+    expect(find.textContaining('반납이 처리됐을 수도 있으니 새로고침'.keepWords), findsOneWidget);
+    expect(find.text('반납하기'), findsOneWidget);
+  });
+
+  testWidgets('반납 중 로그인이 풀렸으면 저장된 계정으로 다시 로그인해서 한 번 더 요청한다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100)])
+      ..releaseScript.add({'success': false, 'code': 'error.authentication.needLogin', 'message': '로그인이 필요합니다'});
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    expect(api.logins, 1);
+    await _openMySeat(tester);
+    await returnFromMySeat(tester);
+
+    expect(api.logins, 2);
+    expect(api.calls, ['return:900', 'return:900']);
+    expect(find.text('지금 갖고 있는 좌석이 없어요.'), findsOneWidget);
+  });
+
+  testWidgets('자동 연장이 도는 중에 반납하면 연장이 바로 끝나고, 이용이 끝났다는 안내를 또 띄우지 않는다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100, renewable: false)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await tester.tap(find.text('자동 연장만 시작'));
+    await _settle(tester, ms: 300);
+    await _openMySeat(tester, running: true);
+    expect(find.text('동작 중'), findsOneWidget);
+    await returnFromMySeat(tester, running: true);
+
+    expect(api.calls, ['return:900']);
+    expect(rig.bg.stops, 1); // 좌석이 없어졌으니 연장을 지켜보던 실행이 끝났다
+    expect(find.text('좌석 이용이 끝났어요'), findsNothing); // 직접 반납한 것이니 따로 알리지 않는다
+    expect(rig.notifier.shown, isEmpty);
+    await tester.pageBack();
+    await _settle(tester, ms: 300);
+    expect(find.text('중지하기'), findsNothing);
+    expect(find.text('좌석 이용이 끝났어요'), findsNothing);
   });
 
   // ---------- 진행 기록 ----------
