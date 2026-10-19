@@ -54,10 +54,12 @@ final class ReserveRejected extends RunOutcome {
   final String message;
 }
 
-/// 가장 원하는 좌석을 이미 갖고 있어서 더 바꿀 좌석이 없다.
+/// 이미 좌석을 갖고 있어서 더 예약하지 않고 끝낸다.
+/// [best] 가 true 면 가장 원하는 좌석이라 더 바꿀 좌석이 없는 것이고, false 면 예약 요청의 응답을 놓쳤거나 다른 곳에서 잡은 좌석이다.
 final class KeepingSeat extends RunOutcome {
-  const KeepingSeat(this.held);
+  const KeepingSeat(this.held, {this.best = true});
   final MyCharge held;
+  final bool best;
 }
 
 /// 좌석을 바꾸려고 기존 좌석을 반납(취소)했지만 새 좌석 예약에 실패했다.
@@ -146,10 +148,14 @@ class RunStatus {
     this.soonest,
     this.errorStreak = 0,
     this.lastError = '',
+    this.heldCode,
   });
 
   final int checks;
   final int wanted;
+
+  /// 이 열람실에서 내가 이미 갖고 있는 좌석 번호 (없으면 null). 있으면 더 원하는 좌석이 나기를 기다리는 중이다.
+  final String? heldCode;
 
   /// 고른 좌석 중 지금 비어 있는 좌석 수.
   final int free;
@@ -219,6 +225,10 @@ class ReservationRunner {
   bool _started = false;
   bool _stopped = false;
   bool _heldChecked = false; // 시작할 때 내 좌석을 한 번 확인했는지 (replaceExisting)
+  bool _hadSeatAtStart = false; // 시작할 때 이미 좌석이 있었고(사용자가 바꾸기로 했다) 그래서 도는 중인지
+
+  /// 예약 요청의 결과를 모르는 채로 남아 있는지 (연결이 끊겼고 내 좌석 확인도 못 했다). 다음 바퀴에서 먼저 확인한다.
+  bool _suspectHeld = false;
   String? _heldCode; // 이 열람실에서 내가 갖고 있는 좌석 번호 (기다릴 대상에서 뺀다)
   final _decided = <String, bool>{}; // 열람실/좌석 번호 → 바꾸기로 했는지. 반납했다 되찾아 예약 번호가 바뀌어도 다시 묻지 않는다
   void Function()? _wake;
@@ -275,6 +285,11 @@ class ReservationRunner {
           _heldChecked = true;
           if (end != null) return end;
         }
+        if (_suspectHeld && !_stopped) {
+          // 지난 예약 요청의 결과를 몰랐다. 좌석이 이미 배정됐는데 또 노리지 않도록 먼저 확인한다.
+          final done = await _outcomeIfHeld(session, null);
+          if (done != null) return done;
+        }
         final seats = await session.seats(roomId);
         _lastSeats = seats;
         if (errorStreak > 0) onLog('서버 연결이 돌아왔어요 ($errorStreak번 실패 후)');
@@ -320,14 +335,30 @@ class ReservationRunner {
             final res = await _reserve(session, seat);
             if (res == null) {
               // 요청 중 연결 오류: 서버에서는 이미 처리됐을 수도 있어서 결과를 알 수 없다.
+              // 응답만 놓치고 배정됐다면 계속 예약을 시도하지 않도록 내 좌석으로 확인한다.
               reserveFails++;
-              onLog('예약 요청 중 연결이 끊겼어요. 배정됐는지 알 수 없어요. 홈페이지에서 확인해 주세요');
+              if (replaceExisting) {
+                onLog('예약 요청 중 연결이 끊겼어요. 배정됐는지 알 수 없어서 내 좌석을 확인해요');
+                _suspectHeld = true;
+                final done = await _outcomeIfHeld(session, seat);
+                if (done != null) return done;
+                onLog(_suspectHeld
+                    ? '내 좌석을 확인하지 못했어요. 다음 확인 때 다시 볼게요. 홈페이지에서 확인해 주세요'
+                    : '내 좌석에는 아직 배정이 없어요. 계속 시도해요');
+              } else {
+                onLog('예약 요청 중 연결이 끊겼어요. 배정됐는지 알 수 없어요. 홈페이지에서 확인해 주세요');
+              }
             } else if (res['success'] == true) {
               onLog('배정 완료! ${seat.code}번 좌석');
               return Reserved(seat);
             } else {
               final msg = '${res['code']} ${res['message']}'.trim();
               onLog('예약 실패: $msg');
+              // 거절됐는데 좌석이 이미 배정돼 있을 수 있다 (이미 좌석이 있는 경우, 응답과 달리 배정된 경우). 그러면 더 시도하지 않는다.
+              if (old == null) {
+                final done = await _outcomeIfHeld(session, seat);
+                if (done != null) return done;
+              }
               final released = old;
               if (released != null) {
                 // 기존 좌석은 이미 반납했다. 원래 좌석을 되찾아 본다.
@@ -385,6 +416,32 @@ class ReservationRunner {
   /// 예약 요청. 연결 오류면 null (결과를 알 수 없음).
   Future<Map<String, dynamic>?> _reserve(LibraryApi session, Seat seat) => _guarded(() => session.reserve(seat.id));
 
+  /// 예약 요청의 결과를 모르거나 거절됐을 때, 그사이 좌석이 실제로 생겼는지 내 좌석으로 확인한다. 생겼으면 끝낼 결과, 아니면 null.
+  /// [tried] 는 방금 예약을 시도한 좌석 (없으면 null). 확인 요청 자체가 실패하면 [_suspectHeld] 를 켜 둬서 다음 바퀴에 다시 본다.
+  /// 응답만 놓치고 이미 배정됐는데 "빈 좌석을 찾는 중"으로 계속 도는 일을 막는다.
+  Future<RunOutcome?> _outcomeIfHeld(LibraryApi session, Seat? tried) async {
+    if (!replaceExisting) return null; // 내 좌석을 다루지 않는 설정에서는 조회하지 않는다
+    final List<MyCharge> mine;
+    try {
+      mine = await session.myCharges();
+    } catch (e) {
+      if (e is SessionException || !_isTransient(e)) rethrow; // 로그인이 풀린 것은 바깥 루프가 다시 로그인한다
+      _suspectHeld = true;
+      return null;
+    }
+    _suspectHeld = false;
+    if (mine.isEmpty) return null;
+    final held = mine.first;
+    final sameRoom = held.roomId == roomId;
+    if (tried != null && sameRoom && held.seatCode == tried.code) {
+      onLog('${tried.code}번 좌석이 이미 배정돼 있었어요');
+      return Reserved(tried);
+    }
+    if (_hadSeatAtStart) return null; // 바꾸기로 하고 시작한 기존 좌석이다. 바꾸는 흐름이 다룬다
+    onLog('${held.seatCode}번 좌석이 이미 배정돼 있어서 예약을 마쳐요');
+    return KeepingSeat(held, best: sameRoom && wanted.isNotEmpty && held.seatCode == wanted.first);
+  }
+
   /// 상태를 바꾸는 요청(예약, 반납). 연결 오류면 null: 서버에서는 이미 처리됐을 수도 있어 결과를 알 수 없다.
   Future<Map<String, dynamic>?> _guarded(Future<Map<String, dynamic>> Function() call) async {
     try {
@@ -418,6 +475,7 @@ class ReservationRunner {
       return (go: true, old: null, end: null);
     }
     final held = mine.first;
+    if (candidate == null) _hadSeatAtStart = true;
     final sameRoom = held.roomId == roomId;
     _heldCode = sameRoom ? held.seatCode : null;
     // 같은 열람실이고 원하는 목록에 든 좌석이면 그 우선순위 (0 이 가장 원하는 좌석), 아니면 -1.
@@ -436,8 +494,9 @@ class ReservationRunner {
         onLog('좌석 바꾸기를 하지 않기로 해서 예약을 시작하지 않아요');
         return (go: false, old: null, end: const Stopped());
       }
-      _logRepeated('바꾸지 않기로 한 ${held.seatCode}번 좌석은 그대로 둬요');
-      return (go: false, old: null, end: null);
+      // 바꾸지 않기로 했다면 이 좌석을 그대로 두고 더 노릴 것이 없다. 계속 돌며 지켜보지 않고 끝낸다 (연장은 호출한 쪽이 이어 간다).
+      onLog('바꾸지 않기로 한 ${held.seatCode}번 좌석은 그대로 두고 예약을 마쳐요');
+      return (go: false, old: null, end: const Stopped());
     }
     if (candidate == null) onLog('지금 ${held.roomName} ${held.seatCode}번 좌석이 있어요. 원하는 좌석이 나면 반납하고 바꿔요');
     return (go: true, old: held, end: null);
@@ -493,6 +552,7 @@ class ReservationRunner {
         soonest: soonestEnding(seats, wanted, exclude: _heldCode),
         errorStreak: errorStreak,
         lastError: lastError,
+        heldCode: _heldCode,
       );
 
   Duration _backoff(int streak) {

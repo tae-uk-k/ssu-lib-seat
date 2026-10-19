@@ -10,6 +10,7 @@ import 'auto_renewer.dart';
 import 'background.dart';
 import 'open_url.dart';
 import 'reservation_runner.dart';
+import 'seat_keeper.dart';
 import 'run_state.dart';
 import 'seat_layout.dart';
 import 'update_check.dart';
@@ -79,6 +80,7 @@ class AppServices {
     this.layoutFor = _defaultLayout,
     this.policyFor = _defaultPolicy,
     this.renewPolicy = const RenewPolicy(),
+    this.keepPolicy = const KeepPolicy(),
     this.logStore = const NoLogStore(),
     this.installer,
     this.quit = _quit,
@@ -123,6 +125,9 @@ class AppServices {
 
   /// 자동 연장 시간표 (종료 30분 전부터, 실패하면 5분 뒤 재시도). 시험에서는 아주 짧게 바꿔 끼운다.
   final RenewPolicy renewPolicy;
+
+  /// 좌석 유지 시간표. 시험에서는 아주 짧게 바꿔 끼운다.
+  final KeepPolicy keepPolicy;
 
   /// 진행 기록을 보관하는 곳. 시험에서는 저장하지 않는다.
   final LogStore logStore;

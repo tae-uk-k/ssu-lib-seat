@@ -77,11 +77,14 @@ RenewPolicy _fast({
   Duration afterRenew = const Duration(milliseconds: 80),
   Duration giveUpAfter = const Duration(seconds: 1),
   Duration seatWait = const Duration(milliseconds: 10),
+  // 서버가 말하는 "1분"의 시험용 길이. 연장할 시각까지의 대기가 밀리초로 줄어든다.
+  Duration minuteLength = const Duration(milliseconds: 1),
 }) =>
     RenewPolicy(
       retryAfter: retryAfter,
       maxPoll: const Duration(milliseconds: 10),
       minPoll: const Duration(milliseconds: 2),
+      minuteLength: minuteLength,
       seatWait: seatWait,
       confirmGap: const Duration(milliseconds: 2),
       afterRenew: afterRenew,
@@ -155,6 +158,58 @@ void main() {
       expect(api.heldCalls, 3, reason: '95분, 31분일 때는 연장하지 않고 다시 조회만 한다');
       expect(h.events.single.kind, RenewEventKind.renewed);
       expect(h.events.single.count, 1);
+    });
+
+    test('연장할 시각(남은 시간 30분)이 될 때까지는 서버에 내 좌석을 다시 묻지 않는다', () async {
+      final api = _Api(held: [
+        [_mine(remaining: 36)], // 30분이 되려면 6분 남았다 (시험에서는 1분을 10밀리초로 줄여 60밀리초)
+        [_mine(remaining: 30)],
+      ]);
+      final h = _Harness(api: api, policy: _fast(minuteLength: const Duration(milliseconds: 10)));
+      final run = h.run();
+      await Future<void>.delayed(const Duration(milliseconds: 35));
+      expect(api.heldCalls, 1, reason: '연장할 시각 전에는 다시 조회하지 않는다 (예전에는 15분마다 조회했다)');
+      expect(api.renewCalls, 0);
+      final out = await run;
+      expect(api.heldCalls, 2); // 시각이 되어 한 번 더 읽고 연장했다
+      expect(api.renewCalls, 1);
+      expect(out.renewed, 1);
+    });
+
+    test('쉬는 동안에는 서버에 묻지 않아도 백그라운드 서비스가 끝났는지는 계속 본다', () async {
+      final api = _Api(held: [
+        [_mine(remaining: 3000)], // 연장 시각까지 아주 오래 남았다 (시험의 1분=10밀리초라도 30초)
+      ]);
+      var aliveChecks = 0;
+      final h = _Harness(
+        api: api,
+        policy: _fast(minuteLength: const Duration(milliseconds: 10)),
+        alive: () async => ++aliveChecks <= 3, // 네 번째 확인부터 서비스가 끝난 것으로 본다
+      );
+      final out = await h.run();
+      expect(out.reason, RenewEndReason.environmentLost);
+      expect(api.heldCalls, 1, reason: '서비스가 끝난 것은 기기에서 알아내고, 서버에는 묻지 않는다');
+      expect(api.renewCalls, 0);
+    });
+
+    test('연장한 뒤에는 늘어난 시간을 한 번만 확인하고, 다음 연장 시각까지 다시 묻지 않는다', () async {
+      final api = _Api(held: [
+        [_mine(remaining: 25)],
+        [_mine(remaining: 265)], // 연장돼서 4시간 25분이 됐다
+      ]);
+      final h = _Harness(
+        api: api,
+        // 다음 연장 시각까지 (265-30)분 = 시험에서 2.35초. 그동안 조회가 없어야 한다
+        policy: _fast(minuteLength: const Duration(milliseconds: 10), afterRenew: const Duration(milliseconds: 20)),
+        stopOn: RenewEventKind.failed,
+      );
+      final run = h.run();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      h.renewer.stop();
+      final out = await run;
+      expect(out.renewed, 1);
+      expect(api.renewCalls, 1);
+      expect(api.heldCalls, 2, reason: '처음 한 번, 연장 직후 확인 한 번뿐이다');
     });
 
     test('남은 시간을 모르면 서버가 연장 가능이라고 할 때 연장한다', () async {

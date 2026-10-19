@@ -13,6 +13,10 @@ const kAppBg = Color(0xFFF4F5F9);
 
 /// 내가 고른 좌석 색. 도면의 구역 색(파랑·금색·청록·연파랑)과 겹치지 않는 분홍 계열.
 const kPicked = Color(0xFFD81B60);
+
+/// 내가 이미 예약해 갖고 있는 좌석 색. 고른 좌석(분홍), 도면의 구역 색과 겹치지 않는 초록.
+const kMineBg = Color(0xFF2E7D32);
+const kMineBorder = Color(0xFF1B5E20);
 const _availBg = Color(0xFFE6F4E8);
 const _usedBg = Color(0xFFEDEDED);
 
@@ -389,7 +393,10 @@ class _RingPainter extends CustomPainter {
 
 /// 좌석 상태 범례.
 class SeatLegend extends StatelessWidget {
-  const SeatLegend({super.key});
+  const SeatLegend({super.key, this.showMine = false});
+
+  /// 이 열람실에 내가 갖고 있는 좌석이 있으면 "내 좌석"도 보인다.
+  final bool showMine;
 
   @override
   Widget build(BuildContext context) {
@@ -408,6 +415,7 @@ class SeatLegend extends StatelessWidget {
         ]);
     return Wrap(spacing: 12, runSpacing: 4, children: [
       item(kPicked, '선택'),
+      if (showMine) item(kMineBg, '내가 예약한 좌석', border: kMineBorder),
       item(_availBg, '비어 있음', border: kGreen),
       item(_usedBg, '사용 중'),
       item(Colors.white, '사용 불가', border: const Color(0xFFD0D0D0)),
@@ -417,11 +425,14 @@ class SeatLegend extends StatelessWidget {
 
 /// 홈페이지처럼 좌석 번호 카드를 나열한다. 선택한 좌석에는 우선순위 숫자가 붙는다.
 class SeatGrid extends StatelessWidget {
-  const SeatGrid({super.key, required this.seats, required this.selected, required this.onTap});
+  const SeatGrid({super.key, required this.seats, required this.selected, required this.onTap, this.mine});
 
   final List<Seat> seats;
   final List<String> selected;
   final void Function(Seat) onTap;
+
+  /// 이 열람실에서 내가 갖고 있는 좌석 번호 (없으면 null).
+  final String? mine;
 
   @override
   Widget build(BuildContext context) {
@@ -430,17 +441,18 @@ class SeatGrid extends StatelessWidget {
       runSpacing: 8,
       children: [
         for (final s in seats)
-          _SeatTile(seat: s, order: selected.indexOf(s.code), onTap: () => onTap(s)),
+          _SeatTile(seat: s, order: selected.indexOf(s.code), mine: s.code == mine, onTap: () => onTap(s)),
       ],
     );
   }
 }
 
 class _SeatTile extends StatelessWidget {
-  const _SeatTile({required this.seat, required this.order, required this.onTap});
+  const _SeatTile({required this.seat, required this.order, required this.onTap, this.mine = false});
 
   final Seat seat;
   final int order; // -1 이면 선택 안 됨
+  final bool mine; // 내가 이미 예약해 갖고 있는 좌석
   final VoidCallback onTap;
 
   @override
@@ -449,7 +461,11 @@ class _SeatTile extends StatelessWidget {
     Color bg;
     Color fg;
     Color border;
-    if (picked) {
+    if (mine) {
+      bg = kMineBg;
+      fg = Colors.white;
+      border = kMineBorder;
+    } else if (picked) {
       bg = kPicked;
       fg = Colors.white;
       border = kPicked;

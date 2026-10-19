@@ -13,7 +13,15 @@ class RenewView {
     required this.threshold,
     required this.retryAfter,
     this.status,
+    this.hunting = false,
+    this.keeping = false,
   });
+
+  /// 빈 좌석을 노리는 예약이 지금 도는 중인지. 도는 중에 좌석을 내놓으면 그 예약도 멈춘다 (안 그러면 곧바로 다시 잡는다).
+  final bool hunting;
+
+  /// 좌석 유지가 도는 중인지. 도는 중에 좌석을 내놓으면 좌석 유지도 멈춘다 (안 그러면 곧바로 다시 예약한다).
+  final bool keeping;
 
   /// 스위치 값 (켜 두었는지).
   final bool enabled;
@@ -41,7 +49,11 @@ String clockText(DateTime t, {DateTime? base}) {
 ///  - 남은 시간이 문턱 이하면 "지금 연장할 시간이에요"
 ///  - 아니면 "연장은 14:10쯤 시작해요" (확인한 시각 + (남은 시간 - 문턱))
 String? renewTimingText(MyCharge held, DateTime checkedAt, Duration threshold) {
-  if (!held.returnable && held.renewable != true) return '아직 이용을 시작하기 전이에요';
+  if (!held.returnable && held.renewable != true) {
+    final exp = held.checkinExpiry;
+    if (exp == null || !exp.isAfter(checkedAt)) return '아직 이용을 시작하기 전이에요';
+    return '아직 이용을 시작하기 전이에요 · ${clockText(exp, base: checkedAt)}까지 도서관 안에서 배정확정이 필요해요';
+  }
   final rem = held.remainingMinutes;
   if (rem == null) return null;
   final limit = threshold.inMinutes;
@@ -60,6 +72,7 @@ class MySeatPage extends StatefulWidget {
     required this.onStart,
     required this.onLogin,
     required this.onReturn,
+    required this.onCheckArrival,
   });
 
   final bool loggedIn;
@@ -80,6 +93,10 @@ class MySeatPage extends StatefulWidget {
   /// 이 좌석을 반납한다 (이용 시작 전이면 배정 취소). 성공하면 null, 실패하면 사용자에게 보일 이유.
   final Future<String?> Function(MyCharge seat) onReturn;
 
+  /// 서버에 "지금 도서관 안에 와 있는지" 한 번 묻는다. [roomId] 는 갖고 있는 좌석의 열람실(없으면 null, 화면이 알아서 정한다).
+  /// 실패하면 예외를 던진다.
+  final Future<ArrivalCheck> Function(int? roomId) onCheckArrival;
+
   @override
   State<MySeatPage> createState() => _MySeatPageState();
 }
@@ -91,6 +108,10 @@ class _MySeatPageState extends State<MySeatPage> {
   bool _loading = false;
   int? _returningId; // 반납을 요청하고 기다리는 중인 좌석 (예약 번호)
   String? _returnError; // 마지막 반납 시도가 실패한 이유
+  bool _arriving = false; // 도서관 안 확인을 요청하고 기다리는 중
+  ArrivalCheck? _arrival; // 마지막 확인 결과
+  DateTime? _arrivalAt;
+  Object? _arrivalError; // 마지막 확인이 요청 자체를 못 한 이유 (연결 오류·로그인 거절)
 
   @override
   void initState() {
@@ -144,7 +165,9 @@ class _MySeatPageState extends State<MySeatPage> {
             (inUse
                     ? '$label을 반납하면 더 이상 쓸 수 없고, 다시 앉으려면 새로 예약해야 해요. 자동 연장도 멈춰요.'
                     : '$label 배정을 취소하면 이 좌석은 사라지고, 다시 앉으려면 새로 예약해야 해요. 자동 연장도 멈춰요.')
-                .keepWords),
+                .keepWords +
+            (widget.view.hunting ? '\n\n${'지금 좌석을 노리는 예약도 같이 멈춰요. 안 그러면 내놓은 좌석을 바로 다시 잡아 버려요.'.keepWords}' : '') +
+            (widget.view.keeping ? '\n\n${'지금 좌석 유지도 같이 멈춰요. 안 그러면 내놓은 좌석을 바로 다시 예약해요.'.keepWords}' : '')),
         actions: [
           TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('아니요')),
           TextButton(
@@ -167,6 +190,28 @@ class _MySeatPageState extends State<MySeatPage> {
       _returnError = why;
     });
     if (why == null) await _refresh(); // 반납됐으니 목록을 다시 읽어 "갖고 있는 좌석이 없어요"가 보이게
+  }
+
+  /// 서버에 도서관 안에 와 있는지 묻는다. 읽기만 하는 요청이라 눌러도 좌석·예약에는 아무 영향이 없다.
+  Future<void> _checkArrival() async {
+    if (_arriving) return;
+    setState(() {
+      _arriving = true;
+      _arrivalError = null;
+    });
+    try {
+      final room = (_charges != null && _charges!.isNotEmpty) ? _charges!.first.roomId : null;
+      final r = await widget.onCheckArrival(room);
+      if (!mounted) return;
+      setState(() {
+        _arrival = r;
+        _arrivalAt = DateTime.now();
+      });
+    } catch (e) {
+      if (mounted) setState(() => _arrivalError = e);
+    } finally {
+      if (mounted) setState(() => _arriving = false);
+    }
   }
 
   String _errorText(Object e) {
@@ -201,6 +246,10 @@ class _MySeatPageState extends State<MySeatPage> {
                 _seatSection(context),
                 const SizedBox(height: 12),
                 _renewCard(context),
+                if (widget.loggedIn) ...[
+                  const SizedBox(height: 12),
+                  _arrivalCard(context),
+                ],
               ],
             ),
           ),
@@ -302,6 +351,7 @@ class _MySeatPageState extends State<MySeatPage> {
           row('남은 시간', rem == null ? '알 수 없어요' : longRemaining(rem)),
           if (rem != null) row('종료 예정', clockText(at.add(Duration(minutes: rem)), base: at)),
           row('확인한 시각', clockText(at)),
+          if (!inUse && c.checkinExpiry != null) row('확정 기한', clockText(c.checkinExpiry!, base: at)),
           if (c.renewable == true)
             Padding(
               padding: const EdgeInsets.only(top: 10),
@@ -310,7 +360,12 @@ class _MySeatPageState extends State<MySeatPage> {
           if (!inUse)
             Padding(
               padding: const EdgeInsets.only(top: 10),
-              child: Text('배정만 된 상태예요. 이용을 시작하면 연장할 수 있어요.'.keepWords,
+              child: Text(
+                  (c.checkinExpiry == null
+                          ? '배정만 된 상태예요. 이용을 시작하면 연장할 수 있어요.'
+                          : '배정만 된 상태예요. 확정 기한까지 도서관 안에서 배정확정(출입 확인)을 하지 않으면 배정이 사라질 수 있어요. '
+                              '이용을 시작하면 연장할 수 있어요.')
+                      .keepWords,
                   style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant)),
             ),
           const SizedBox(height: 12),
@@ -355,7 +410,7 @@ class _MySeatPageState extends State<MySeatPage> {
           secondary: Icon(Icons.autorenew, color: scheme.primary),
           title: const Text('자동 연장', style: TextStyle(fontWeight: FontWeight.w600)),
           subtitle: Text(
-              '이용 종료 ${v.threshold.inMinutes}분 전부터 연장해요. 안 되면 ${v.retryAfter.inMinutes}분 뒤 다시 시도해요.'.keepWords,
+              '이용 종료 ${v.threshold.inMinutes}분 전까지는 조회하지 않고, 그때부터 연장해요. 안 되면 ${v.retryAfter.inMinutes}분 뒤 다시 시도해요.'.keepWords,
               style: TextStyle(fontSize: 12, height: 1.35, color: scheme.onSurfaceVariant)),
           value: v.enabled,
           onChanged: widget.onToggle,
@@ -364,6 +419,80 @@ class _MySeatPageState extends State<MySeatPage> {
         Padding(padding: const EdgeInsets.all(16), child: _renewStatus(context)),
       ]),
     );
+  }
+
+  /// 서버가 지금 나를 도서관 안으로 보는지 (입구 게이트 확인). 자동 연장이 연장 직전에 하는 것과 같은 확인이다.
+  Widget _arrivalCard(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final dim = TextStyle(fontSize: 13, height: 1.4, color: scheme.onSurfaceVariant);
+    final r = _arrival;
+    final at = _arrivalAt;
+
+    Widget result(IconData icon, Color color, String title, {String? detail}) => Padding(
+          padding: const EdgeInsets.only(top: 12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Icon(icon, size: 20, color: color),
+              const SizedBox(width: 8),
+              Expanded(child: Text(title.keepWords, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: color))),
+            ]),
+            if (at != null)
+              Padding(padding: const EdgeInsets.only(top: 3), child: Text('${clockText(at)} 확인', style: dim)),
+            if (detail != null) Padding(padding: const EdgeInsets.only(top: 3), child: Text(detail.keepWords, style: dim)),
+          ]),
+        );
+
+    Widget? shown;
+    if (r != null) {
+      if (r.confirmed) {
+        shown = result(Icons.check_circle, kGreen, '도서관 안에 있는 것으로 확인됐어요');
+      } else if (r.accepted) {
+        shown = result(Icons.remove_circle_outline, const Color(0xFFE65100), '도서관 안에서는 확인되지 않았어요',
+            detail: '도서관 밖이거나, 서버가 출입을 아직 확인하지 못했을 때 이렇게 나와요.');
+      } else {
+        final why = '${r.code} ${r.message}'.trim();
+        shown = result(Icons.error_outline, scheme.error, '서버가 확인을 거절했어요', detail: why.isEmpty ? null : why);
+      }
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Icon(Icons.meeting_room_outlined, color: scheme.primary),
+          const SizedBox(width: 10),
+          const Expanded(child: Text('도서관 안 확인', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600))),
+        ]),
+        const SizedBox(height: 4),
+        Text('입구 게이트 출입 기록을 서버에 물어봐요.'.keepWords, style: dim),
+        const SizedBox(height: 12),
+        OutlinedButton.icon(
+          onPressed: _arriving ? null : _checkArrival,
+          icon: _arriving
+              ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+              : const Icon(Icons.travel_explore, size: 18),
+          label: Text(_arriving ? '확인하는 중…' : '지금 확인'),
+        ),
+        if (_arrivalError != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: Text(_arrivalErrorText(_arrivalError!).keepWords,
+                style: TextStyle(fontSize: 12.5, height: 1.4, fontWeight: FontWeight.w600, color: scheme.error)),
+          ),
+        ?shown,
+      ]),
+    );
+  }
+
+  String _arrivalErrorText(Object e) {
+    if (e is LoginException) return '로그인에 실패했어요. 학번과 비밀번호를 확인해 주세요.';
+    if (e is SessionException) return '로그인이 풀렸어요. 다시 로그인해 주세요.';
+    return '확인하지 못했어요. 잠시 뒤 다시 시도해 주세요.';
   }
 
   /// 자동 연장이 "지금 실제로" 하고 있는 일.

@@ -150,7 +150,16 @@ class MyCharge {
     this.remainingMinutes,
     this.renewable,
     this.arrivalMethods = const [],
+    this.checkinable,
+    this.checkinExpiry,
   });
+
+  /// 배정만 되고 아직 확정 전이라 도서관 안에서 "배정확정"을 해야 하는지 (홈페이지의 `isCheckinable`). 값이 없으면 null.
+  final bool? checkinable;
+
+  /// 배정확정을 해야 하는 기한 (홈페이지의 `checkinExpiryDate`). 값이 없거나 읽을 수 없으면 null.
+  /// 이 시각까지 확정하지 않으면 배정이 사라질 수 있다.
+  final DateTime? checkinExpiry;
 
   /// 예약(배정) 번호. 취소할 때 쓴다. 좌석 번호가 아니다.
   final int id;
@@ -179,6 +188,8 @@ class MyCharge {
     final renewable = j['isRenewable'];
     final remaining = j['remainingTime'];
     final methods = j['arrivalConfirmMethods'];
+    final checkinable = j['isCheckinable'];
+    final expiry = j['checkinExpiryDate'];
     return MyCharge(
       id: j['id'] as int,
       seatId: seat['id'] as int,
@@ -189,6 +200,10 @@ class MyCharge {
       remainingMinutes: remaining is num ? remaining.toInt() : (remaining is String ? int.tryParse(remaining) : null),
       renewable: renewable is bool ? renewable : null,
       arrivalMethods: methods is List ? [for (final m in methods) '$m'] : const [],
+      checkinable: checkinable is bool ? checkinable : null,
+      checkinExpiry: expiry is String
+          ? DateTime.tryParse(expiry.trim().replaceFirst(' ', 'T'))
+          : (expiry is num && expiry > 0 ? DateTime.fromMillisecondsSinceEpoch(expiry.toInt()) : null),
     );
   }
 }
@@ -219,6 +234,22 @@ abstract interface class LibraryApi {
   /// 도서관 안에 와 있는지 서버에 확인한다 ([method] 는 [MyCharge.arrivalMethods] 중 하나, 이 앱은 GATE 만 한다).
   /// 홈페이지도 연장하기 전에 이 확인을 한다. 확인되면 true. 로그인이 풀렸으면 [SessionException].
   Future<bool> checkArrival(int roomId, String method);
+
+  /// [checkArrival] 와 같은 요청인데, 서버가 준 코드·메시지까지 돌려준다 (화면에 "도서관 안 확인" 결과를 보일 때 쓴다).
+  /// 좌석이 없어도 요청은 받아들여진다 (방 번호만 있으면 됨). 로그인이 풀렸으면 [SessionException].
+  Future<ArrivalCheck> arrivalCheck(int roomId, String method);
+}
+
+/// 도착 확인 한 번의 결과.
+class ArrivalCheck {
+  const ArrivalCheck({required this.accepted, required this.confirmed, this.code = '', this.message = ''});
+
+  /// 서버가 요청을 받아들였는지 (`success`). false 면 [confirmed] 는 의미가 없고 [code]·[message] 가 이유다.
+  final bool accepted;
+
+  /// 서버가 "도서관 안에 와 있다"고 본 것 (`success` 이고 `data` 가 true).
+  final bool confirmed;
+  final String code, message;
 }
 
 class LibApi implements LibraryApi {
@@ -361,9 +392,18 @@ class LibApi implements LibraryApi {
   }
 
   @override
-  Future<bool> checkArrival(int roomId, String method) async {
+  Future<bool> checkArrival(int roomId, String method) async => (await arrivalCheck(roomId, method)).confirmed;
+
+  @override
+  Future<ArrivalCheck> arrivalCheck(int roomId, String method) async {
     final r = await _dio.post('/$_homepageId/api/rooms/$roomId/check-arrival', data: {'methodCode': method});
     final j = _needLoginCheck(_json(r));
-    return j['success'] == true && j['data'] == true;
+    final accepted = j['success'] == true;
+    return ArrivalCheck(
+      accepted: accepted,
+      confirmed: accepted && j['data'] == true,
+      code: '${j['code'] ?? ''}',
+      message: '${j['message'] ?? ''}',
+    );
   }
 }

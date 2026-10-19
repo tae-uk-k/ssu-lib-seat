@@ -12,6 +12,7 @@ import 'package:lib_seat/background.dart';
 import 'package:lib_seat/main.dart';
 import 'package:lib_seat/my_seat_page.dart';
 import 'package:lib_seat/reservation_runner.dart';
+import 'package:lib_seat/seat_keeper.dart';
 import 'package:lib_seat/seat_map.dart';
 import 'package:lib_seat/run_state.dart';
 import 'package:lib_seat/seat_layout.dart';
@@ -134,6 +135,52 @@ class FakeLibrary implements LibraryApi {
   Future<bool> checkArrival(int roomId, String method) async {
     calls.add('arrival:$method');
     return arrived;
+  }
+
+  /// 내 좌석 화면의 "도서관 안 확인"이 받는 응답. 비어 있으면 [arrived] 로 만든다. [arrivalFailure] 가 있으면 대신 던진다.
+  ArrivalCheck? arrivalResult;
+  Exception? arrivalFailure;
+
+  /// 다음 한 번만 던질 오류 (로그인이 풀렸다가 다시 로그인하면 정상으로 돌아오는 상황).
+  Exception? arrivalFailureOnce;
+  final arrivalRooms = <int>[];
+
+  @override
+  Future<ArrivalCheck> arrivalCheck(int roomId, String method) async {
+    arrivalRooms.add(roomId);
+    calls.add('arrivalCheck:$method');
+    final once = arrivalFailureOnce;
+    if (once != null) {
+      arrivalFailureOnce = null;
+      throw once;
+    }
+    if (arrivalFailure != null) throw arrivalFailure!;
+    return arrivalResult ?? ArrivalCheck(accepted: true, confirmed: arrived);
+  }
+}
+
+/// 좌석을 반납하면 그 7번 좌석이 비어 보이게 되는 서버 (반납 직후 예약 루프가 같은 좌석을 다시 잡는지 보려고).
+class _FreeingLibrary extends FakeLibrary {
+  _FreeingLibrary({super.script, super.held});
+
+  @override
+  Future<Map<String, dynamic>> returnCharge(int chargeId) async {
+    final r = await super.returnCharge(chargeId);
+    if (r['success'] == true) script.add(_seats(free: {7}));
+    return r;
+  }
+}
+
+/// 예약 요청에는 "거절"이라고 답하지만 실제로는 좌석이 배정돼 있는 서버 (응답과 달리 배정된 경우).
+class _AssignedButRejectedLibrary extends FakeLibrary {
+  _AssignedButRejectedLibrary({super.script}) : super(held: []);
+
+  @override
+  Future<Map<String, dynamic>> reserve(int seatId) async {
+    await super.reserve(seatId); // 호출 횟수를 센다
+    // 노린 좌석이 아니라 다른 좌석(3번)이 배정돼 있다 (응답을 놓친 예약이 아니라 다른 곳에서 잡은 경우)
+    held.add(MyCharge(id: 900, seatId: 103, seatCode: '3', roomId: 53, roomName: '숭실스퀘어ON(2F)', returnable: false));
+    return {'success': false, 'code': 'error.x', 'message': '처리 중 오류가 났어요'};
   }
 }
 
@@ -348,6 +395,19 @@ class Rig {
           errorBackoff: Duration(milliseconds: 5),
           maxErrorBackoff: Duration(milliseconds: 20),
         ),
+        keepPolicy: const KeepPolicy(
+          unconfirmedPoll: Duration(milliseconds: 40),
+          edgePoll: Duration(milliseconds: 10),
+          confirmedPoll: Duration(milliseconds: 40),
+          afterEnd: Duration(milliseconds: 5),
+          afterReserve: Duration(milliseconds: 5),
+          minuteLength: Duration(milliseconds: 1),
+          minWait: Duration(milliseconds: 5),
+          rejectedWait: Duration(milliseconds: 50),
+          errorBackoff: Duration(milliseconds: 5),
+          maxErrorBackoff: Duration(milliseconds: 20),
+          aliveEvery: Duration(milliseconds: 40),
+        ),
         // 확인 간격을 시험용으로 아주 짧게
         policyFor: (_) => const RunPolicy(
           interval: Duration(milliseconds: 20),
@@ -405,6 +465,21 @@ Future<void> _login(WidgetTester tester) async {
   await tester.tap(find.widgetWithText(FilledButton, '로그인'));
   await _settle(tester);
 }
+
+/// 도면에서 내가 예약한 좌석 색(초록 바탕 + 진한 초록 테두리)으로 칠해진 칸. 화면의 다른 초록 원(완료 표시)과 구별하려고 테두리까지 본다.
+Finder _mineTiles() => find.byWidgetPredicate((w) {
+      if (w is! DecoratedBox || w.decoration is! BoxDecoration) return false;
+      final d = w.decoration as BoxDecoration;
+      final border = d.border;
+      return d.color == kMineBg && border is Border && border.top.color == kMineBorder && d.shape == BoxShape.rectangle;
+    });
+
+/// 도면에서 "내가 고른 좌석" 색(분홍)으로 칠해진 칸 (사용 중인 좌석은 조금 연하게 칠한다).
+Finder _pickedTiles() => find.byWidgetPredicate((w) {
+      if (w is! DecoratedBox || w.decoration is! BoxDecoration) return false;
+      final c = (w.decoration as BoxDecoration).color;
+      return c == kPicked || c == kPicked.withValues(alpha: 0.78);
+    });
 
 Future<void> _pickList(WidgetTester tester, List<String> codes) async {
   // 도면이 없는 열람실이라 번호 카드가 보인다. 카드를 직접 눌러 고른다.
@@ -1285,12 +1360,12 @@ void main() {
 
     expect(api.calls, ['arrival:GATE', 'renew:900']); // 도서관 안 확인 → 연장, 서버 값이 바로 안 바뀌어도 한 번만
     expect(rig.bg.starts, 1);
-    expect(find.text('중지하기'), findsOneWidget); // 계속 지켜본다
+    expect(find.text('자동 연장 중지'), findsOneWidget); // 계속 지켜본다
     expect(find.text('자동 연장을 지켜보는 중이에요'), findsOneWidget);
     expect(find.textContaining('이번 실행에서 1번 연장했어요'), findsOneWidget);
     expect(find.textContaining('5번 좌석을 연장했어요'), findsOneWidget); // 앱이 보이는 중이라 알림 대신 안내
 
-    await tester.tap(find.text('중지하기'));
+    await tester.tap(find.text('자동 연장 중지'));
     await _settle(tester, ms: 200);
     expect(find.text('자동 연장만 시작'), findsOneWidget);
     expect(rig.bg.stops, 1);
@@ -1321,7 +1396,7 @@ void main() {
     expect(find.textContaining('연장에 실패했어요'.keepWords), findsNothing);
     expect(rig.notifier.shown.last, startsWith('연장했어요'));
 
-    await tester.tap(find.text('중지하기'));
+    await tester.tap(find.text('자동 연장 중지'));
     await _settle(tester, ms: 200);
   });
 
@@ -1353,13 +1428,14 @@ void main() {
     expect(find.textContaining('자동 연장만 계속해요'.keepWords), findsOneWidget);
     await tester.tap(find.widgetWithText(TextButton, '확인'));
     await _settleAnimRunning(tester);
-    expect(find.text('중지하기'), findsOneWidget); // 끝나지 않고 연장을 지켜본다
-    expect(find.text('자동 연장을 지켜보는 중이에요'), findsOneWidget);
+    expect(find.text('자동 연장 중지'), findsOneWidget); // 끝나지 않고 연장을 지켜본다
+    expect(find.text('5번 좌석을 이미 갖고 있어요'), findsNWidgets(2)); // 실행 배너와 4단계 카드. "빈 좌석을 찾는 중"이 아니라 이미 갖고 있다고 보인다
+    expect(find.text('빈 좌석을 찾는 중이에요'), findsNothing);
     expect(find.textContaining('이용 종료까지 1시간 40분'.keepWords), findsOneWidget);
     expect(api.calls, isEmpty); // 아직 때가 아니라 연장하지 않았다
     expect(rig.bg.stops, 0);
 
-    await tester.tap(find.text('중지하기'));
+    await tester.tap(find.text('자동 연장 중지'));
     await _settle(tester, ms: 200);
     expect(rig.bg.stops, 1);
   });
@@ -1377,13 +1453,13 @@ void main() {
     await tester.tap(find.text('아니요'));
     await _settle(tester, ms: 400);
 
-    expect(find.text('중지하기'), findsOneWidget); // 끝나지 않고
+    expect(find.text('자동 연장 중지'), findsOneWidget); // 끝나지 않고
     expect(find.text('자동 연장을 지켜보는 중이에요'), findsOneWidget); // 연장을 이어 간다
     expect(api.calls, contains('renew:900')); // 남은 시간이 20분이라 연장했다
     expect(api.calls.where((c) => c.startsWith('cancel') || c.startsWith('return')), isEmpty); // 좌석은 건드리지 않았다
     expect(rig.bg.stops, 0);
 
-    await tester.tap(find.text('중지하기'));
+    await tester.tap(find.text('자동 연장 중지'));
     await _settle(tester, ms: 200);
     expect(rig.bg.stops, 1);
   });
@@ -1503,7 +1579,7 @@ void main() {
     expect(find.text('종료 예정'), findsOneWidget);
     expect(find.text('확인한 시각'), findsOneWidget);
     expect(find.text('꺼져 있어요'), findsOneWidget); // 시험 기본값은 자동 연장 꺼짐
-    expect(api.heldCalls, 1);
+    expect(api.heldCalls, 2, reason: '좌석 목록을 불러올 때 한 번(도면에 내 좌석 색을 보이려고), 이 화면을 열 때 한 번');
   });
 
   testWidgets('내 좌석: 이용 시작 전 좌석은 그렇게 표시하고 연장할 수 없다고 알려 준다', (tester) async {
@@ -1523,6 +1599,59 @@ void main() {
     await _login(tester);
     await _openMySeat(tester);
     expect(find.text('지금 갖고 있는 좌석이 없어요.'), findsOneWidget);
+  });
+
+  testWidgets('내 좌석: 좌석이 없어도 "도서관 안 확인"으로 서버에 물어 결과를 보여 주고 기록에 남긴다 (예약·연장은 건드리지 않는다)', (tester) async {
+    final api = FakeLibrary()
+      ..arrivalResult = const ArrivalCheck(accepted: true, confirmed: false, code: 'success.confirmed');
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    expect(find.text('지금 갖고 있는 좌석이 없어요.'), findsOneWidget);
+    expect(api.arrivalRooms, isEmpty, reason: '버튼을 누르기 전에는 묻지 않는다');
+
+    await tester.tap(find.text('지금 확인'));
+    await _settleAnim(tester);
+    expect(api.arrivalRooms, [53]); // 좌석이 없으니 고른 열람실
+    expect(find.text('도서관 안에서는 확인되지 않았어요'.keepWords), findsOneWidget);
+    expect(api.calls, ['arrivalCheck:GATE']); // 예약·연장·반납 요청은 없다
+    expect(rig.logStore.lines.any((l) => l.contains('도서관 안 확인(53번 열람실): 확인되지 않음 [success.confirmed]')), isTrue);
+
+    api.arrivalResult = const ArrivalCheck(accepted: true, confirmed: true, code: 'success.confirmed');
+    await tester.tap(find.text('지금 확인'));
+    await _settleAnim(tester);
+    expect(find.text('도서관 안에 있는 것으로 확인됐어요'.keepWords), findsOneWidget);
+    expect(rig.logStore.lines.any((l) => l.contains('안에 있는 것으로 확인됨')), isTrue);
+  });
+
+  testWidgets('내 좌석: 도서관 안 확인은 갖고 있는 좌석의 열람실로 묻고, 로그인이 풀렸으면 다시 로그인해서 한 번 더 묻는다', (tester) async {
+    final api = FakeLibrary(held: [mine(remaining: 100)])
+      ..arrivalResult = const ArrivalCheck(accepted: true, confirmed: true);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    expect(api.logins, 1);
+
+    api.arrivalFailureOnce = SessionException('로그인이 필요합니다');
+    await tester.tap(find.text('지금 확인'));
+    await _settleAnim(tester);
+    expect(api.logins, 2);
+    expect(api.arrivalRooms, [53, 53]); // 실패한 요청과 다시 로그인한 뒤의 요청
+    expect(find.text('도서관 안에 있는 것으로 확인됐어요'.keepWords), findsOneWidget);
+  });
+
+  testWidgets('내 좌석: 도서관 안 확인이 연결 오류로 실패하면 안내하고 기록에 남긴다', (tester) async {
+    final api = FakeLibrary()..arrivalFailure = ApiException('서버 오류 (HTTP 503)');
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    await tester.tap(find.text('지금 확인'));
+    await _settleAnim(tester);
+    expect(find.text('확인하지 못했어요. 잠시 뒤 다시 시도해 주세요.'.keepWords), findsOneWidget);
+    expect(rig.logStore.lines.any((l) => l.contains('도서관 안 확인 실패')), isTrue);
   });
 
   testWidgets('내 좌석: 조회가 실패하면 안내하고 다시 시도할 수 있다', (tester) async {
@@ -1712,7 +1841,7 @@ void main() {
     expect(find.text('자동 연장 동작 중'), findsOneWidget);
     expect(find.textContaining('연장은 '.keepWords), findsOneWidget);
     expect(find.text('자동 연장 켜짐 · 시작하면 함께 동작해요'), findsNothing); // 도는 동안에는 배너가 대신한다
-    await tester.tap(find.text('중지하기'));
+    await tester.tap(find.text('자동 연장 중지'));
     await _settle(tester, ms: 300);
   });
 
@@ -1734,12 +1863,14 @@ void main() {
     expect(find.text('자동 연장 켜짐'), findsOneWidget);
     expect(find.text('예약 시작'), findsNothing); // 4단계 제목도 "자동 연장 시작"
     expect(find.text('자동 연장 시작'), findsOneWidget);
+    expect(find.text('자동 연장 중'), findsNothing); // 아직 시작하는 중이다
 
     rig.bg.startGate!.complete();
     await _settle(tester, ms: 300);
     expect(find.text('자동 연장을 지켜보는 중이에요'), findsOneWidget);
-    expect(find.text('자동 연장 시작'), findsOneWidget);
-    await tester.tap(find.text('중지하기'));
+    expect(find.text('자동 연장 중'), findsOneWidget); // 도는 중에는 "시작"이 아니라 하고 있는 중이라고 보인다
+    expect(find.text('자동 연장 시작'), findsNothing);
+    await tester.tap(find.text('자동 연장 중지'));
     await _settle(tester, ms: 300);
   });
 
@@ -1887,6 +2018,124 @@ void main() {
     expect(find.text('좌석 이용이 끝났어요'), findsNothing);
   });
 
+  testWidgets('좌석을 노리는 예약이 도는 중에 좌석을 내놓으면 예약도 멈춰서, 내놓은 좌석을 바로 다시 잡지 않는다', (tester) async {
+    SharedPreferences.setMockInitialValues({'autoRenew': false});
+    // 7번을 이용 중인데 더 원하는 5번을 노리는 중이다. 7번을 내놓으면 7번이 비어 보인다 (예전에는 이때 곧바로 다시 예약했다).
+    final api = _FreeingLibrary(script: [_seats()], held: [mine(remaining: 100, code: '7')]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5', '7']);
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: 100);
+    await tester.tap(find.text('바꾸기'));
+    await _settle(tester, ms: 200);
+    expect(find.text('중지하기'), findsOneWidget); // 더 원하는 5번을 기다리며 도는 중
+    expect(find.textContaining('지금 7번 좌석을 갖고 있어요'.keepWords), findsWidgets); // 계속 도는 이유가 보인다 (배너와 4단계 카드)
+
+    await _openMySeat(tester, running: true);
+    await tester.tap(find.text('반납하기'));
+    await _settle(tester, ms: 200);
+    expect(find.textContaining('좌석을 노리는 예약도 같이 멈춰요'.keepWords), findsOneWidget); // 확인 창에서 미리 알린다
+    await tester.tap(find.widgetWithText(TextButton, '반납'));
+    await _settle(tester, ms: 800);
+
+    expect(api.calls, ['return:900']);
+    expect(api.reservedIds, isEmpty); // 내놓은 7번(이제 비어 보인다)을 다시 잡지 않았다
+    expect(find.textContaining('좌석을 노리던 예약도 멈췄어요'), findsOneWidget);
+    expect(find.text('지금 갖고 있는 좌석이 없어요.'), findsOneWidget);
+    await tester.pageBack();
+    await _settle(tester, ms: 300);
+    expect(find.text('중지하기'), findsNothing); // 예약도 끝났다
+    expect(rig.bg.stops, 1);
+  });
+
+  testWidgets('이미 좌석이 있는데 더 원하는 좌석을 노리는 중이면 "좌석 찾기만 멈추기"로 좌석과 자동 연장은 그대로 두고 찾기만 멈춘다', (tester) async {
+    SharedPreferences.setMockInitialValues({}); // 자동 연장 켜짐
+    final api = FakeLibrary(script: [_seats()], held: [mine(remaining: 100, code: '7', renewable: false)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5', '7']);
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: 100);
+    await tester.tap(find.text('바꾸기'));
+    await _settle(tester, ms: 300);
+
+    expect(find.text('빈 좌석을 찾는 중이에요'), findsOneWidget);
+    expect(find.text('중지하기'), findsOneWidget); // 좌석을 노리는 동안에는 예전처럼 "중지하기"
+    expect(find.text('자동 연장 중지'), findsNothing);
+    expect(find.textContaining('지금 7번 좌석을 갖고 있어요'.keepWords), findsWidgets); // 배너와 4단계 카드
+    expect(find.text('좌석 찾기만 멈추기 (자동 연장은 계속)'), findsOneWidget);
+
+    await tester.tap(find.text('좌석 찾기만 멈추기 (자동 연장은 계속)'));
+    await _settle(tester, ms: 400);
+
+    expect(find.text('빈 좌석을 찾는 중이에요'), findsNothing);
+    expect(find.text('자동 연장을 지켜보는 중이에요'), findsOneWidget); // 연장은 그대로 돈다
+    expect(find.text('좌석 찾기만 멈추기 (자동 연장은 계속)'), findsNothing);
+    expect(find.text('자동 연장 중지'), findsOneWidget);
+    expect(rig.bg.stops, 0); // 실행은 끝나지 않았다
+    expect(api.calls, isEmpty); // 좌석은 건드리지 않았다
+    expect(api.reservedIds, isEmpty);
+
+    await tester.tap(find.text('자동 연장 중지'));
+    await _settle(tester, ms: 300);
+    expect(rig.bg.stops, 1);
+  });
+
+  testWidgets('좌석을 노리는 중에 내놓기가 거절되면 좌석은 그대로이고, 예약만 멈춘 상태라고 알린다', (tester) async {
+    SharedPreferences.setMockInitialValues({'autoRenew': false});
+    final api = FakeLibrary(script: [_seats()], held: [mine(remaining: 100, code: '7')])
+      ..releaseScript.add({'success': false, 'code': 'error.x', 'message': '지금은 반납할 수 없어요'});
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5', '7']);
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: 100);
+    await tester.tap(find.text('바꾸기'));
+    await _settle(tester, ms: 200);
+    await _openMySeat(tester, running: true);
+    await returnFromMySeat(tester, running: true);
+
+    expect(find.textContaining('반납하지 못했어요. error.x 지금은 반납할 수 없어요'.keepWords), findsOneWidget);
+    expect(find.textContaining('좌석을 노리던 예약은 멈춘 상태예요'.keepWords), findsOneWidget);
+    expect(find.text('반납하기'), findsOneWidget); // 좌석은 그대로라 다시 시도할 수 있다
+    expect(api.reservedIds, isEmpty);
+  });
+
+  testWidgets('화면에 보이던 상태가 오래됐어도 서버의 지금 상태에 맞게 처리한다 (이용 시작 전 → 이용 중이 됐으면 취소가 아니라 반납)', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(held: [mine(remaining: 100, inUse: false)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _openMySeat(tester);
+    expect(find.text('배정 취소하기'), findsOneWidget);
+
+    api.held[0] = mine(remaining: 100); // 그사이 도서관에 들어가 이용이 시작됐다 (화면은 아직 모른다)
+    await returnFromMySeat(tester, button: '배정 취소하기', confirm: '배정 취소');
+
+    expect(api.calls, ['return:900']); // 취소(DELETE)가 아니라 반납
+    expect(find.text('지금 갖고 있는 좌석이 없어요.'), findsOneWidget);
+  });
+
+  testWidgets('예약 요청이 거절됐는데 좌석이 이미 배정돼 있으면 거절만 되풀이하지 않고 배정돼 있다고 알리며 마친다', (tester) async {
+    SharedPreferences.setMockInitialValues({'autoRenew': false});
+    final api = _AssignedButRejectedLibrary(script: [_seats(free: {5})]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5']);
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: 400);
+
+    expect(api.reserveCalls, 1); // 거절을 여러 번 채우지 않았다
+    expect(find.text('좌석이 이미 배정돼 있어요'), findsWidgets);
+    expect(find.text('중지하기'), findsNothing);
+  });
+
   // ---------- 진행 기록 ----------
 
   testWidgets('진행 기록: 앱이 한 일(시작, 불러오기, 로그인, 자동 연장 스위치)이 남고 저장소에도 저장된다', (tester) async {
@@ -1918,11 +2167,11 @@ void main() {
     await _settle(tester, ms: 300);
     await _openLog(tester, running: true);
     expect(find.textContaining('내 좌석 확인: 5번 · 남은 100분'), findsOneWidget); // 같은 내용은 한 번만
-    expect(find.textContaining('자동 연장 켜짐: 이용 종료 30분 전부터'), findsOneWidget);
+    expect(find.textContaining('자동 연장 켜짐: 이용 종료 30분 전까지는 내 좌석을 다시 조회하지 않고'), findsOneWidget);
     expect(find.textContaining('좌석 예약 없이 내 좌석의 연장만 지켜봐요'), findsOneWidget);
     await tester.pageBack();
     await _settle(tester, ms: 400);
-    await tester.tap(find.text('중지하기'));
+    await tester.tap(find.text('자동 연장 중지'));
     await _settle(tester, ms: 300);
   });
 
@@ -1985,7 +2234,8 @@ void main() {
     expect(api.reservedIds, [108]);
     expect(find.text('중지하기'), findsNothing);
     expect(rig.bg.stops, 1);
-    expect(api.heldCalls, 2, reason: '내 좌석 조회는 예약 루프가 시작할 때와 빈 좌석을 찾았을 때뿐이다 (자동 연장 루프가 따로 조회하지 않는다)');
+    expect(api.heldCalls, 3,
+        reason: '내 좌석 조회는 좌석 목록을 불러올 때(도면에 내 좌석 색을 보이려고), 예약 루프가 시작할 때, 빈 좌석을 찾았을 때뿐이다 (자동 연장 루프가 따로 조회하지 않는다)');
   });
 
   testWidgets('좌석을 받으면 팝업으로 알리고 자동 연장으로 이어서, 받은 좌석을 지켜본다', (tester) async {
@@ -2003,14 +2253,253 @@ void main() {
     expect(find.textContaining('이용 종료 30분 전에 연장해요'.keepWords), findsOneWidget);
     await tester.tap(find.widgetWithText(TextButton, '확인'));
     await _settleAnimRunning(tester);
-    expect(find.text('자동 연장을 지켜보는 중이에요'), findsOneWidget);
+    // 좌석을 받았으니 "예약 중"이 아니라 배정 완료로 보이고, 자동 연장만 이어서 지켜본다.
+    expect(find.text('5번 좌석 배정 완료'), findsNWidgets(2)); // 실행 배너와, 화면 아래쪽에서도 보이는 4단계 카드
+    expect(find.text('빈 좌석을 찾는 중이에요'), findsNothing);
+    expect(find.text('예약 시작'), findsNothing); // 4단계 제목도 더는 "예약 시작"이 아니다
+    expect(find.text('자동 연장 중'), findsOneWidget);
+    // 예약은 끝났으니 빨간 "중지하기"가 아니라, 자동 연장만 멈추는 차분한 버튼이다.
+    expect(find.text('중지하기'), findsNothing);
+    ButtonStyleButton stopButton(String label) =>
+        tester.widget<ButtonStyleButton>(find.ancestor(of: find.text(label), matching: find.bySubtype<ButtonStyleButton>()));
+    final errorColor = Theme.of(tester.element(find.byType(Scaffold).first)).colorScheme.error;
+    expect(stopButton('자동 연장 중지').style!.backgroundColor!.resolve({}), isNot(errorColor));
+    expect(find.byIcon(Icons.check_circle), findsOneWidget); // 돌아가는 진행 표시 대신 완료 표시
+    expect(find.byType(CircularProgressIndicator), findsNothing);
     expect(find.textContaining('5번 좌석'.keepWords), findsWidgets);
     expect(find.textContaining('이용 종료까지 1시간 40분'.keepWords), findsOneWidget);
     expect(rig.bg.stops, 0);
 
-    await tester.tap(find.text('중지하기'));
+    await tester.tap(find.text('자동 연장 중지'));
     await _settle(tester, ms: 200);
     expect(rig.bg.stops, 1);
+  });
+
+  testWidgets('예약에 성공하면 도면에서 내가 예약한 좌석이 다른 색으로 보이고, 더는 "고른 좌석"(분홍)으로 보이지 않는다', (tester) async {
+    SharedPreferences.setMockInitialValues({'autoRenew': false, 'sel_53': ['5']});
+    final api = FakeLibrary(script: [_seats(), _seats(free: {5})], held: [])..grantOnReserve = mine(remaining: 100);
+    final rig = Rig(api: api, withMap: true);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    expect(_mineTiles(), findsNothing); // 아직 내 좌석이 없다
+    expect(_pickedTiles(), findsOneWidget); // 5번을 고른 상태
+
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: 300);
+    expect(api.reservedIds, [105]);
+    await tester.tap(find.widgetWithText(TextButton, '확인')); // 배정 완료 팝업
+    await _settleAnim(tester);
+
+    expect(_mineTiles(), findsOneWidget);
+    expect(find.descendant(of: _mineTiles(), matching: find.text('5')), findsOneWidget);
+    expect(_pickedTiles(), findsNothing); // 이미 받은 좌석이 "고르는 중"으로 보이면 안 된다
+  });
+
+  testWidgets('이미 갖고 있는 좌석도 좌석 목록을 불러올 때 도면에 다른 색으로 보이고, 크게 열면 범례에도 나온다', (tester) async {
+    final api = FakeLibrary(script: [_seats()], held: [mine(code: '7')]);
+    final rig = Rig(api: api, withMap: true);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    expect(_mineTiles(), findsOneWidget);
+    expect(find.descendant(of: _mineTiles(), matching: find.text('7')), findsOneWidget);
+    expect(api.calls, isEmpty); // 읽기만 했다
+
+    await tester.tap(find.text('도면에서 좌석 고르기'));
+    await _settleAnim(tester);
+    expect(find.byType(SeatMapPage), findsOneWidget);
+    expect(find.text('내가 예약한 좌석'), findsOneWidget);
+    expect(_mineTiles(), findsWidgets);
+  });
+
+  testWidgets('좌석이 없으면 도면에 내 좌석 색도 범례도 없다', (tester) async {
+    final rig = Rig(api: FakeLibrary(script: [_seats()]), withMap: true);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    expect(_mineTiles(), findsNothing);
+    await tester.tap(find.text('도면에서 좌석 고르기'));
+    await _settleAnim(tester);
+    expect(find.text('내가 예약한 좌석'), findsNothing);
+    expect(_mineTiles(), findsNothing);
+  });
+
+  testWidgets('도면이 없는 열람실의 번호 카드에서도 내 좌석이 다른 색으로 보인다', (tester) async {
+    final rig = Rig(api: FakeLibrary(script: [_seats()], held: [mine(code: '7')]));
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    expect(find.text('내가 예약한 좌석'), findsOneWidget); // 범례
+    final card = find.ancestor(of: find.text('7'), matching: find.byType(Material)).first;
+    expect(tester.widget<Material>(card).color, kMineBg);
+    final other = find.ancestor(of: find.text('8'), matching: find.byType(Material)).first;
+    expect(tester.widget<Material>(other).color, isNot(kMineBg));
+  });
+
+  // ---------- 좌석 유지 ----------
+
+  /// 메뉴에서 "좌석 유지" 화면을 연다.
+  Future<void> openKeepSeat(WidgetTester tester, {bool running = false}) async {
+    await tester.tap(find.byTooltip('메뉴'));
+    await (running ? _settle(tester, ms: 400) : _settleAnim(tester));
+    await tester.tap(find.text('좌석 유지'));
+    await (running ? _settle(tester, ms: 600) : _settleAnim(tester));
+  }
+
+  bool buttonEnabled(WidgetTester tester, String label) =>
+      tester.widget<ButtonStyleButton>(find.ancestor(of: find.text(label), matching: find.bySubtype<ButtonStyleButton>())).onPressed != null;
+
+  testWidgets('좌석 유지: 로그인 전에는 로그인하라고 알린다', (tester) async {
+    final rig = Rig(api: FakeLibrary(script: [_seats(free: {5})]));
+    await _pumpApp(tester, rig);
+    await _openMenu(tester);
+    expect(find.text('좌석 유지'), findsOneWidget);
+    expect(find.text('꺼짐'), findsOneWidget);
+    await tester.tap(find.text('좌석 유지'));
+    await _settleAnim(tester);
+    expect(find.text('로그인하면 좌석 유지를 쓸 수 있어요.'), findsOneWidget);
+    expect(find.text('좌석 유지 시작'), findsNothing);
+  });
+
+  testWidgets('좌석 유지: 열람실·좌석·끝나는 시간을 정해 시작하면 좌석을 잡고, 사라지면 다시 예약하고, 중지하면 멈춘다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final api = FakeLibrary(script: [_seats(free: {5})], held: [])..grantOnReserve = mine(remaining: 100);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await openKeepSeat(tester);
+
+    // 아직 아무것도 안 골랐으니 시작할 수 없다
+    expect(find.text('좌석을 계속 갖고 있어요'), findsOneWidget);
+    expect(buttonEnabled(tester, '좌석 유지 시작'), isFalse);
+
+    await tester.tap(find.text('숭실스퀘어ON(2F)')); // 열람실
+    await _settleAnim(tester);
+    await tester.tap(find.text('좌석 고르기'));
+    await _settleAnim(tester);
+    await tester.tap(find.text('5').first);
+    await tester.pump();
+    await tester.tap(find.text('완료'));
+    await _settleAnim(tester);
+    expect(find.text('1순위 5번'), findsOneWidget);
+
+    await tester.tap(find.text('2시간 뒤')); // 끝나는 시간
+    await _settleAnim(tester);
+    expect(find.textContaining('에 끝나요.'), findsOneWidget);
+    expect(buttonEnabled(tester, '좌석 유지 시작'), isTrue);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getInt('keep_room'), 53); // 설정은 저장된다
+    expect(prefs.getStringList('keep_sel_53'), ['5']);
+    expect(prefs.getString('keep_endMode'), 'after');
+    expect(prefs.getInt('keep_endAfter'), 120);
+
+    await tester.tap(find.text('좌석 유지 시작'));
+    await _settle(tester, ms: 400);
+    expect(api.reservedIds, [105]);
+    expect(rig.bg.starts, 1);
+    expect(find.text('좌석 유지 중'), findsOneWidget);
+    expect(find.textContaining('5번 (이용 중)'), findsOneWidget);
+    expect(find.text('좌석 유지 중지'), findsOneWidget);
+    expect(find.text('좌석 유지 시작'), findsNothing);
+
+    api.held.clear(); // 도서관이 좌석을 없앴다 (취소, 배정 풀림, 이용 시간 끝 모두 같다)
+    await _settle(tester, ms: 400);
+    expect(api.reservedIds, [105, 105]); // 다시 예약했다
+    expect(find.textContaining('이번 실행에서 2번'), findsOneWidget);
+
+    await tester.tap(find.text('좌석 유지 중지'));
+    await _settle(tester, ms: 400);
+    expect(rig.bg.stops, 1);
+    expect(find.text('좌석 유지 시작'), findsOneWidget); // 설정 화면으로 돌아왔다
+    expect(find.textContaining('좌석 유지를 멈췄어요 (다시 예약 2번)'.keepWords), findsOneWidget);
+    expect(api.calls.where((c) => c.startsWith('cancel') || c.startsWith('return')), isEmpty); // 좌석은 건드리지 않았다
+  });
+
+  testWidgets('좌석 유지: 도는 동안 메인 화면에 표시가 뜨고, 예약은 겹쳐 시작할 수 없으며, 메뉴에 동작 중으로 보인다', (tester) async {
+    SharedPreferences.setMockInitialValues({'keep_room': 53, 'keep_sel_53': ['5']});
+    final api = FakeLibrary(script: [_seats(free: {5})], held: [])..grantOnReserve = mine(remaining: 100);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await openKeepSeat(tester);
+    await tester.tap(find.text('좌석 유지 시작'));
+    await _settle(tester, ms: 300);
+    await tester.pageBack();
+    await _settle(tester, ms: 600);
+
+    expect(find.text('좌석 유지 중'), findsOneWidget); // 메인 화면의 안내 카드
+    expect(find.textContaining('5번 좌석 · 이용 중'), findsOneWidget);
+    await tester.tap(find.text('자동 연장만 시작')); // 눌러도 시작되지 않는다 (이 시험은 자동 연장이 켜진 기본값이다)
+    await _settle(tester, ms: 100);
+    expect(rig.bg.starts, 1);
+    expect(find.text('좌석 유지가 도는 중이에요. 메뉴의 좌석 유지에서 먼저 중지해 주세요.'), findsNothing); // 버튼이 막혀 있어 안내 없이 무시된다
+    await tester.tap(find.byTooltip('메뉴'));
+    await _settle(tester, ms: 400);
+    expect(find.text('동작 중 · 5번 좌석'), findsOneWidget);
+    await tester.tap(find.text('좌석 유지'));
+    await _settle(tester, ms: 600);
+    await tester.tap(find.text('좌석 유지 중지'));
+    await _settle(tester, ms: 400);
+    expect(rig.bg.stops, 1);
+  });
+
+  testWidgets('좌석 유지: 도는 중에 좌석을 반납하면 좌석 유지도 멈춰서 내놓은 좌석을 다시 예약하지 않는다', (tester) async {
+    SharedPreferences.setMockInitialValues({'keep_room': 53, 'keep_sel_53': ['7']});
+    final api = _FreeingLibrary(script: [_seats(free: {7})], held: [])..grantOnReserve = mine(remaining: 100, code: '7');
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await openKeepSeat(tester);
+    await tester.tap(find.text('좌석 유지 시작'));
+    await _settle(tester, ms: 300);
+    expect(api.reservedIds, [107]);
+    await tester.pageBack();
+    await _settle(tester, ms: 200);
+
+    await _openMySeat(tester, running: true);
+    await tester.tap(find.text('반납하기'));
+    await _settle(tester, ms: 200);
+    expect(find.textContaining('좌석 유지도 같이 멈춰요'.keepWords), findsOneWidget); // 확인 창에서 미리 알린다
+    await tester.tap(find.widgetWithText(TextButton, '반납'));
+    await _settle(tester, ms: 800);
+
+    expect(api.calls.where((c) => c.startsWith('return')), ['return:900']);
+    expect(api.reservedIds, [107]); // 내놓은 7번(이제 비어 보인다)을 다시 예약하지 않았다
+    expect(find.textContaining('좌석 유지도 멈췄어요'), findsOneWidget);
+    expect(rig.bg.stops, 1);
+  });
+
+  testWidgets('좌석 유지: 정한 종료 시각이 되면 마치고 알린다', (tester) async {
+    // 시작하는 순간 이미 종료 시각이다 (0분 뒤)
+    SharedPreferences.setMockInitialValues({'keep_room': 53, 'keep_sel_53': ['5'], 'keep_endMode': 'after', 'keep_endAfter': 0});
+    final api = FakeLibrary(script: [_seats(free: {5})], held: []);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await openKeepSeat(tester);
+    await tester.tap(find.text('좌석 유지 시작'));
+    await _settle(tester, ms: 300);
+    await _settleAnim(tester);
+
+    expect(find.text('좌석 유지를 마쳤어요'), findsWidgets); // 팝업과 메인 화면의 결과 카드
+    expect(find.textContaining('정한 종료 시각이 돼서 멈췄어요'.keepWords), findsWidgets);
+    expect(api.reserveCalls, 0);
+    expect(rig.bg.stops, 1);
+  });
+
+  testWidgets('좌석 유지: 예약이 도는 중에는 시작할 수 없다고 알린다', (tester) async {
+    SharedPreferences.setMockInitialValues({'keep_room': 53, 'keep_sel_53': ['5'], 'autoRenew': false});
+    final rig = Rig(api: FakeLibrary(script: [_seats()]));
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await _pickList(tester, ['5']);
+    await tester.tap(find.textContaining('좌석 예약 시작'));
+    await _settle(tester, ms: 200);
+    await openKeepSeat(tester, running: true);
+
+    expect(find.textContaining('예약이 도는 중이라 시작할 수 없어요'.keepWords), findsOneWidget);
+    expect(buttonEnabled(tester, '좌석 유지 시작'), isFalse);
+    await tester.pageBack();
+    await _settle(tester, ms: 200);
+    await tester.tap(find.text('중지하기'));
+    await _settle(tester, ms: 300);
   });
 
   testWidgets('새 버전이 없다고 나오면 확인한 시각을 기록해 둔다', (tester) async {

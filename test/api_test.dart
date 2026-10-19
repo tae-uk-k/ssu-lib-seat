@@ -286,6 +286,35 @@ void main() {
       expect(await _api((_) => _json({'success': true})).checkArrival(53, 'GATE'), isFalse);
     });
 
+    test('arrivalCheck 는 서버가 요청을 받아들였는지, 안에 있다고 봤는지, 코드·메시지를 따로 돌려준다 (좌석 없이 방 번호만 보낸다)', () async {
+      RequestOptions? seen;
+      // 실서버로 확인한 도서관 밖 + 좌석 없음의 응답 모양
+      final out = await _api((o) {
+        seen = o;
+        return _json({'success': true, 'code': 'success.confirmed', 'data': false});
+      }).arrivalCheck(53, 'GATE');
+      expect(seen!.path, endsWith('/1/api/rooms/53/check-arrival'));
+      expect(seen!.data, {'methodCode': 'GATE'}, reason: '좌석·예약 번호는 보내지 않는다');
+      expect((out.accepted, out.confirmed, out.code), (true, false, 'success.confirmed'));
+
+      final inside = await _api((_) => _json({'success': true, 'code': 'success.confirmed', 'data': true})).arrivalCheck(53, 'GATE');
+      expect((inside.accepted, inside.confirmed), (true, true));
+
+      final refused = await _api((_) => _json({'success': false, 'code': 'error.x', 'message': '거절', 'data': true})).arrivalCheck(53, 'GATE');
+      expect((refused.accepted, refused.confirmed, refused.code, refused.message), (false, false, 'error.x', '거절'),
+          reason: '거절됐으면 data 가 true 여도 확인된 것이 아니다');
+
+      final bare = await _api((_) => _json({'success': true})).arrivalCheck(53, 'GATE');
+      expect((bare.accepted, bare.confirmed, bare.code, bare.message), (true, false, '', ''));
+    });
+
+    test('arrivalCheck 도 로그인 필요로 거절되면 SessionException, 서버 오류는 ApiException', () async {
+      await expectLater(
+          _api((_) => _json({'success': false, 'code': 'error.authentication.needLogin'})).arrivalCheck(53, 'GATE'),
+          throwsA(isA<SessionException>()));
+      await expectLater(_api((_) => _json({'success': false}, 503)).arrivalCheck(53, 'GATE'), throwsA(isA<ApiException>()));
+    });
+
     test('도착 확인이 로그인 필요로 거절되면 SessionException', () async {
       await expectLater(
           _api((_) => _json({'success': false, 'code': 'error.authentication.needLogin'})).checkArrival(53, 'GATE'),

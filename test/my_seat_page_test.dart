@@ -76,6 +76,7 @@ void main() {
       void Function(bool)? onToggle,
       VoidCallback? onStart,
       Future<String?> Function(MyCharge)? onReturn,
+      Future<ArrivalCheck> Function(int?)? onCheckArrival,
     }) async {
       tester.view.physicalSize = const Size(800, 1600);
       tester.view.devicePixelRatio = 1;
@@ -89,6 +90,7 @@ void main() {
           onStart: onStart ?? () {},
           onLogin: () async {},
           onReturn: onReturn ?? (_) async => null,
+          onCheckArrival: onCheckArrival ?? (_) async => const ArrivalCheck(accepted: true, confirmed: false),
         ),
       ));
       await tester.pump();
@@ -251,6 +253,103 @@ void main() {
         gate.complete('반납하지 못했어요.');
         await tester.pumpAndSettle();
         expect(find.text('반납하기'), findsOneWidget);
+      });
+    });
+    group('도서관 안 확인', () {
+      testWidgets('로그인했을 때만 보이고, 누르기 전에는 서버에 묻지 않는다', (tester) async {
+        var asked = 0;
+        await pump(tester, load: () async => [], v: view(), onCheckArrival: (_) async {
+          asked++;
+          return const ArrivalCheck(accepted: true, confirmed: true);
+        });
+        expect(find.text('도서관 안 확인'), findsOneWidget);
+        expect(find.text('지금 확인'), findsOneWidget);
+        expect(asked, 0);
+
+        await tester.pumpWidget(const SizedBox());
+        await pump(tester, loggedIn: false, load: () async => [], v: view());
+        expect(find.text('도서관 안 확인'), findsNothing);
+      });
+
+      testWidgets('안에 있다고 확인되면 그렇게 보여 주고, 갖고 있는 좌석의 열람실로 묻는다', (tester) async {
+        final rooms = <int?>[];
+        await pump(tester, load: () async => [_charge()], v: view(), onCheckArrival: (room) async {
+          rooms.add(room);
+          return const ArrivalCheck(accepted: true, confirmed: true, code: 'success.confirmed');
+        });
+        await tester.tap(find.text('지금 확인'));
+        await tester.pumpAndSettle();
+        expect(rooms, [53]);
+        expect(find.text('도서관 안에 있는 것으로 확인됐어요'.keepWords), findsOneWidget);
+        expect(find.textContaining('확인되지 않았어요'.keepWords), findsNothing);
+      });
+
+      testWidgets('좌석이 없어도 묻는다 (열람실은 화면이 정하도록 null 을 넘긴다)', (tester) async {
+        final rooms = <int?>[];
+        await pump(tester, load: () async => [], v: view(), onCheckArrival: (room) async {
+          rooms.add(room);
+          return const ArrivalCheck(accepted: true, confirmed: false, code: 'success.confirmed');
+        });
+        await tester.tap(find.text('지금 확인'));
+        await tester.pumpAndSettle();
+        expect(rooms, [null]);
+        expect(find.text('도서관 안에서는 확인되지 않았어요'.keepWords), findsOneWidget);
+        expect(find.textContaining('도서관 밖이거나'.keepWords), findsOneWidget);
+      });
+
+      testWidgets('서버가 거절하면 서버가 준 코드와 메시지를 보여 준다', (tester) async {
+        await pump(tester, load: () async => [], v: view(), onCheckArrival: (_) async {
+          return const ArrivalCheck(accepted: false, confirmed: false, code: 'error.x', message: '확인할 수 없어요');
+        });
+        await tester.tap(find.text('지금 확인'));
+        await tester.pumpAndSettle();
+        expect(find.text('서버가 확인을 거절했어요'.keepWords), findsOneWidget);
+        expect(find.textContaining('error.x 확인할 수 없어요'.keepWords), findsOneWidget);
+      });
+
+      testWidgets('요청이 실패하면 안내하고 다시 누를 수 있다. 로그인 거절·풀림은 따로 안내한다', (tester) async {
+        var tries = 0;
+        Object? failure = Exception('연결 끊김');
+        await pump(tester, load: () async => [], v: view(), onCheckArrival: (_) async {
+          tries++;
+          final f = failure;
+          if (f != null) throw f;
+          return const ArrivalCheck(accepted: true, confirmed: true);
+        });
+        await tester.tap(find.text('지금 확인'));
+        await tester.pumpAndSettle();
+        expect(find.text('확인하지 못했어요. 잠시 뒤 다시 시도해 주세요.'.keepWords), findsOneWidget);
+
+        failure = SessionException('x');
+        await tester.tap(find.text('지금 확인'));
+        await tester.pumpAndSettle();
+        expect(find.text('로그인이 풀렸어요. 다시 로그인해 주세요.'.keepWords), findsOneWidget);
+
+        failure = LoginException('x');
+        await tester.tap(find.text('지금 확인'));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('로그인에 실패했어요'.keepWords), findsOneWidget);
+
+        failure = null;
+        await tester.tap(find.text('지금 확인'));
+        await tester.pumpAndSettle();
+        expect(tries, 4);
+        expect(find.text('도서관 안에 있는 것으로 확인됐어요'.keepWords), findsOneWidget);
+        expect(find.textContaining('확인하지 못했어요'.keepWords), findsNothing, reason: '성공하면 이전 오류 안내는 사라진다');
+      });
+
+      testWidgets('묻는 동안에는 "확인하는 중…"으로 바뀌고 다시 누를 수 없다', (tester) async {
+        final gate = Completer<ArrivalCheck>();
+        await pump(tester, load: () async => [], v: view(), onCheckArrival: (_) => gate.future);
+        await tester.tap(find.text('지금 확인'));
+        await tester.pump();
+        expect(find.text('확인하는 중…'), findsOneWidget);
+        final button = find.ancestor(of: find.text('확인하는 중…'), matching: find.bySubtype<OutlinedButton>());
+        expect(tester.widget<OutlinedButton>(button).onPressed, isNull);
+
+        gate.complete(const ArrivalCheck(accepted: true, confirmed: true));
+        await tester.pumpAndSettle();
+        expect(find.text('지금 확인'), findsOneWidget);
       });
     });
   });

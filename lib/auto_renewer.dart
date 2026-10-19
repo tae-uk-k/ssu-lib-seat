@@ -11,6 +11,8 @@ import 'reservation_runner.dart' show LoginFn;
 // 지키는 규칙
 //  - 홈페이지와 같은 순서로 연장한다: (도서관에 와 있는지 확인) → 연장 요청. 확인 방법에 GATE 가 있으면 서버에 확인하고,
 //    AUTO 거나 이 앱이 못 하는 방법(GPS, 비콘, NFC)뿐이면 확인 없이 연장을 요청해서 서버가 판단하게 둔다.
+//  - **이용 종료 [RenewPolicy.threshold] 전이 될 때까지는 서버에 내 좌석을 다시 묻지 않는다.** 시작할 때 한 번 남은 시간을 읽고,
+//    연장할 시각까지 쉰 뒤에 다시 읽는다. 쉬는 동안에는 백그라운드 서비스가 살아 있는지만 (서버가 아니라 기기에서) 본다.
 //  - 연장이 실패하면(도서관 밖, 서버 거절, 연결 오류 모두) [RenewPolicy.retryAfter] 뒤에 다시 시도한다. 남은 시간이 있는 동안 계속.
 //  - 방금 연장한 좌석은 서버 값이 바뀔 때까지 [RenewPolicy.afterRenew] 동안 다시 연장하지 않는다 (연장 횟수는 제한이 있다).
 //  - 학번/비밀번호가 거절되면 재시도 없이 멈춘다. 로그인이 풀린 경우에만 다시 로그인한다 (예약 루프와 같은 규칙).
@@ -24,7 +26,8 @@ class RenewPolicy {
     this.retryAfter = const Duration(minutes: 5),
     this.maxPoll = const Duration(minutes: 15),
     this.minPoll = const Duration(seconds: 30),
-    this.seatWait = const Duration(minutes: 5),
+    this.minuteLength = const Duration(minutes: 1),
+    this.seatWait = const Duration(minutes: 15),
     this.confirmGap = const Duration(seconds: 5),
     this.afterRenew = const Duration(minutes: 10),
     this.errorBackoff = const Duration(seconds: 15),
@@ -40,10 +43,14 @@ class RenewPolicy {
   /// 연장이 실패했을 때 다시 시도하기까지 기다리는 시간.
   final Duration retryAfter;
 
-  /// 아직 때가 아닐 때 내 좌석을 다시 조회하기까지의 최대/최소 간격. 남은 시간은 서버가 알려 주는 값이라 문턱까지는 멀리 쉬고,
-  /// 문턱이 가까워지면 그 시각에 맞춰 깨어난다 (한 번 갈 때마다 서버를 두드리는 일을 줄인다).
+  /// [maxPoll]: 오래 쉬는 동안 백그라운드 서비스가 살아 있는지 기기에서 확인하는 간격 (서버에는 묻지 않는다), 그리고 좌석이 없고
+  /// 예약 루프가 노리는 중일 때 다시 조회하는 간격. [minPoll]: 연장 직후 등 다시 조회하기까지의 최소 간격.
+  /// 아직 때가 아니면 남은 시간으로 계산한 연장 시각까지 서버에 묻지 않고 쉰다.
   final Duration maxPoll;
   final Duration minPoll;
+
+  /// 서버가 알려 주는 "남은 시간 1분"의 실제 길이. 실제 앱은 1분이고, 시험에서만 짧게 줄여 연장 시각까지의 대기를 빠르게 한다.
+  final Duration minuteLength;
 
   /// 좌석이 없고 예약 루프가 좌석을 노리는 중일 때 다시 조회하는 간격. 예약 루프가 좌석을 받으면 [SeatRenewer.nudge] 로 바로 깨우므로 길어도 된다.
   final Duration seatWait;
@@ -303,7 +310,7 @@ class SeatRenewer {
         onStatus(_status(_last, errorStreak: errorStreak, lastError: lastError));
         wait = _backoff(errorStreak);
       }
-      await _sleep(wait);
+      if (!await _sleepLong(wait)) return _end(RenewEndReason.environmentLost);
     }
     return _end(RenewEndReason.stopped);
   }
@@ -329,23 +336,27 @@ class SeatRenewer {
     final limit = policy.threshold.inMinutes;
     _noteCheck(held, rem);
 
+    // 방금 연장했는데 서버 값이 아직 안 바뀌어 여전히 연장할 때처럼 보이면 바뀔 때까지 기다린다 (연장 횟수는 제한이 있다).
+    // 남은 시간이 이미 늘어나 있으면 이 기다림은 필요 없다 (아래에서 연장 시각까지 쉰다).
     final renewedAt = _lastRenewedAt;
-    if (renewedAt != null) {
+    if (renewedAt != null && (rem == null || rem <= limit)) {
       final since = _now().difference(renewedAt);
-      if (since < policy.afterRenew) return _clamp(policy.afterRenew - since); // 방금 연장했다. 서버 값이 바뀔 때까지 기다린다
+      if (since < policy.afterRenew) return _clamp(policy.afterRenew - since);
     }
 
     // 아직 이용이 시작되지 않은 좌석(배정만 되고 확정 전)은 연장할 수 없다. 서버가 연장 가능이라고 하지 않는 한 기다린다.
+    // 연장할 시각이 한참 남았으면 그때까지 묻지 않고, 연장할 시각이 됐는데 아직 확정 전이면 확정되는 때를 보려고 [RenewPolicy.retryAfter] 마다 본다.
     if (!held.returnable && held.renewable != true) {
       _logRepeated('${held.seatCode}번 좌석은 아직 이용을 시작하기 전이라 연장하지 않아요');
-      return policy.seatWait;
+      if (rem != null && rem > limit) return _untilDue(rem - limit);
+      return rem == null ? policy.maxPoll : policy.retryAfter;
     }
 
     // 남은 시간을 알면 그걸로, 모르면 서버가 "연장 가능"이라고 한 때를 때로 본다.
     final due = rem != null ? rem <= limit : held.renewable == true;
     if (!due) {
       if (rem == null) return policy.maxPoll;
-      return _clamp(Duration(minutes: rem - limit)); // 문턱이 가까우면 그 시각에 맞춰 깨어난다
+      return _untilDue(rem - limit); // 연장할 시각까지는 서버에 묻지 않는다
     }
     if (held.renewable == false) {
       _logRepeated('${held.seatCode}번 좌석이 ${rem ?? '?'}분 남았지만 서버가 아직 연장할 수 없다고 해요. ${_fmt(policy.retryAfter)} 뒤 다시 확인해요');
@@ -414,6 +425,12 @@ class SeatRenewer {
 
   Duration _clamp(Duration d) => d < policy.minPoll ? policy.minPoll : (d > policy.maxPoll ? policy.maxPoll : d);
 
+  /// 남은 시간이 문턱보다 [minutes] 분 많을 때, 연장할 시각까지의 대기 시간 (그사이에는 서버에 묻지 않는다).
+  Duration _untilDue(int minutes) {
+    final d = policy.minuteLength * minutes;
+    return d < policy.minPoll ? policy.minPoll : d;
+  }
+
   Duration _backoff(int streak) {
     var d = policy.errorBackoff;
     for (var i = 1; i < streak && d < policy.maxErrorBackoff; i++) {
@@ -454,22 +471,36 @@ class SeatRenewer {
     if (_repeat % 40 == 0) onLog('$msg (연속 $_repeat번)');
   }
 
-  Future<void> _sleep(Duration d) {
+  /// 쉰다. 시간이 다 돼서 깨면 false, 멈추라고 하거나 [nudge] 로 깨우면 true.
+  Future<bool> _sleep(Duration d) {
     if (_stopped || _nudged) {
       _nudged = false;
-      return Future.value();
+      return Future.value(true);
     }
-    final done = Completer<void>();
+    final done = Completer<bool>();
     final timer = Timer(d, () {
-      if (!done.isCompleted) done.complete();
+      if (!done.isCompleted) done.complete(false);
     });
     _wake = () {
       timer.cancel();
-      if (!done.isCompleted) done.complete();
+      if (!done.isCompleted) done.complete(true);
     };
     return done.future.whenComplete(() {
       _wake = null;
       _nudged = false;
     });
+  }
+
+  /// 오래 쉰다. 쉬는 동안 서버에는 묻지 않고, 백그라운드 서비스가 살아 있는지만 [RenewPolicy.maxPoll] 마다 본다.
+  /// 멈추라고 하거나 깨우면 바로 돌아온다. 서비스가 끝났으면 false.
+  Future<bool> _sleepLong(Duration total) async {
+    var left = total;
+    while (left > Duration.zero) {
+      final step = left > policy.maxPoll ? policy.maxPoll : left;
+      if (await _sleep(step)) return true;
+      left -= step;
+      if (left > Duration.zero && !await _alive()) return false;
+    }
+    return true;
   }
 }

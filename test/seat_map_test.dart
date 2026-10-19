@@ -1,8 +1,12 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lib_seat/api.dart';
 import 'package:lib_seat/seat_layout.dart';
 import 'package:lib_seat/seat_map.dart';
+import 'package:lib_seat/widgets.dart';
 
 List<Seat> _seats(int n) => [for (var i = 0; i < n; i++) Seat(id: i, code: '${i + 1}', active: true, occupied: false)];
 
@@ -42,6 +46,50 @@ void main() {
     final c = tester.getCenter(find.byType(SeatMapPreview));
     await _drag(tester, c, c - const Offset(0, 200));
     expect(scroll.offset, greaterThan(100));
+  });
+
+  testWidgets('내가 예약한 좌석은 구역 색·고른 좌석(분홍)과 다른 색이고, 고른 순서 표시는 그대로 남는다', (tester) async {
+    phone(tester);
+    // 도면은 에셋 대신 파일에서 직접 읽는다 (에셋 읽기가 진행 중인 채 시험이 끝나면 이후 시험까지 막힌다).
+    final layout = SeatLayout.fromJson(jsonDecode(File('assets/layouts/r54.json').readAsStringSync()) as Map<String, dynamic>);
+    // 3번은 내가 예약해서 사용 중으로 내려온다. 4번은 다른 사람이 쓰는 좌석.
+    final seats = [
+      for (var i = 0; i < layout.seats.length; i++)
+        Seat(id: i, code: '${i + 1}', active: true, occupied: i == 2 || i == 3, remainingTime: i == 2 ? 100 : 0, chargeTime: 240),
+    ];
+    // 칸만 센다 (테두리가 있는 사각형). 범례의 작은 칸은 이 화면에 없다.
+    Finder tiles(Color c) => find.byWidgetPredicate((w) =>
+        w is DecoratedBox &&
+        w.decoration is BoxDecoration &&
+        (w.decoration as BoxDecoration).color == c &&
+        (w.decoration as BoxDecoration).border != null);
+
+    Future<void> show({String? mine, List<String> selected = const []}) => tester.pumpWidget(MaterialApp(
+          home: Scaffold(
+            body: SeatMapPreview(layout: layout, seats: seats, selected: selected, mine: mine, onOpen: () {}),
+          ),
+        ));
+
+    await show();
+    expect(tiles(kMineBg), findsNothing); // 내 좌석을 모르면 평소 색 그대로
+
+    await show(mine: '3');
+    expect(tiles(kMineBg), findsOneWidget);
+    expect(find.descendant(of: tiles(kMineBg), matching: find.text('3')), findsOneWidget);
+    expect(find.descendant(of: tiles(kMineBg), matching: find.text('4')), findsNothing);
+
+    // 고른 목록에도 들어 있으면 내 좌석 색이 우선이고(이미 받은 좌석), 우선순위 숫자만 남는다.
+    await show(mine: '3', selected: ['3']);
+    expect(tiles(kMineBg), findsOneWidget);
+    expect(tiles(kPicked), findsNothing);
+    expect(tiles(kPicked.withValues(alpha: 0.78)), findsNothing);
+    expect(find.text('1'), findsWidgets); // 우선순위 1 (좌석 1번 칸과 같은 글자라 개수만 본다)
+
+    // 범례는 내 좌석이 있을 때만 "내가 예약한 좌석"을 보인다.
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: SeatMapLegend(layout: layout))));
+    expect(find.text('내가 예약한 좌석'), findsNothing);
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: SeatMapLegend(layout: layout, showMine: true))));
+    expect(find.text('내가 예약한 좌석'), findsOneWidget);
   });
 
   testWidgets('전체 화면 도면: 시작 배율, 한 손가락 이동, 좌석 탭, 축소 상태 핀치', (tester) async {

@@ -87,6 +87,8 @@ class FakeApi implements LibraryApi {
   Future<Map<String, dynamic>> renewCharge(int chargeId) async => {'success': true};
   @override
   Future<bool> checkArrival(int roomId, String method) async => true;
+  @override
+  Future<ArrivalCheck> arrivalCheck(int roomId, String method) async => const ArrivalCheck(accepted: true, confirmed: true);
 
   @override
   Future<void> login(String uid, String pw) async {}
@@ -544,7 +546,7 @@ void main() {
       expect(asked, [('1', -1)]);
     });
 
-    test('실행 도중 새로 생긴 내 좌석은 따로 물어보고, 거절하면 건드리지 않고 계속 지켜본다', () async {
+    test('실행 도중 새로 생긴 내 좌석은 따로 물어보고, 거절하면 건드리지 않고 예약을 마친다 (끝없이 지켜보지 않는다)', () async {
       final asked = <(String, int)>[];
       final api = FakeApi(
         seatScript: [room(free: {'1'})],
@@ -552,14 +554,79 @@ void main() {
         heldScript: [<MyCharge>[], [_held('7')]],
       );
       final h = _Harness(api: api, replace: true, confirm: yes(asked, answer: false));
-      final done = h.runner.run();
-      while (h.statuses.length < 10) {
-        await Future<void>.delayed(const Duration(milliseconds: 2));
-      }
-      h.runner.stop();
-      expect(await done, isA<Stopped>());
+      final out = await h.run(); // 사용자가 멈추지 않아도 스스로 끝난다
+      expect(out, isA<Stopped>());
+      expect(h.runner.isStopped, isFalse); // 멈춘 게 아니라 바꾸지 않기로 해서 끝났다 (자동 연장은 이어 갈 수 있다)
       expect(asked, [('7', -1)]); // 같은 좌석은 한 번만 묻는다
       expect(api.calls, isEmpty);
+      expect(api.seatCalls, 1);
+    });
+
+    test('예약 요청의 응답만 놓치고 배정됐다면 내 좌석으로 확인하고, 더 시도하지 않고 배정 완료로 끝낸다', () async {
+      final api = FakeApi(
+        seatScript: [room(free: {'1'})],
+        reserveScript: [_net()], // 서버는 처리했는데 응답이 끊겼다 (도서관 밖의 불안정한 데이터 연결)
+        // 시작할 때는 없었고, 끊긴 뒤 확인하니 1번이 내 좌석으로 있다
+        heldScript: [<MyCharge>[], <MyCharge>[], [_held('1')]],
+      );
+      final h = _Harness(api: api, replace: true);
+      final out = await h.run();
+      expect(out, isA<Reserved>());
+      expect((out as Reserved).seat.code, '1');
+      expect(api.reserveCalls, 1); // 다시 예약을 시도하지 않았다
+    });
+
+    test('끊긴 뒤 내 좌석 확인도 안 되면 다음 바퀴에서 먼저 확인하고, 빈 좌석이 없어도 끝없이 찾지 않는다', () async {
+      final api = FakeApi(
+        // 1번은 비어 보이다가(방금 내가 예약한 좌석) 곧 사용 중으로 보인다. 2번은 처음부터 사용 중이다
+        seatScript: [room(free: {'1'}), room()],
+        reserveScript: [_net()],
+        // 시작 확인(없음) → 예약 직전 확인(없음) → 끊긴 뒤 확인(연결 오류) → 다음 바퀴 맨 앞의 확인(2번이 내 좌석으로 있다)
+        heldScript: [<MyCharge>[], <MyCharge>[], _net(), [_held('2')]],
+      );
+      final h = _Harness(api: api, replace: true, wanted: ['1', '2']);
+      final out = await h.run();
+      expect(out, isA<KeepingSeat>());
+      expect((out as KeepingSeat).held.seatCode, '2');
+      expect(out.best, isFalse); // 가장 원하는 1번이 아니라 2번이 배정돼 있다
+      expect(api.reserveCalls, 1);
+      expect(h.logs.any((l) => l.contains('내 좌석을 확인하지 못했어요')), isTrue);
+    });
+
+    test('예약이 거절됐는데 좌석이 이미 배정돼 있으면 거절을 8번 채우지 않고 바로 끝낸다', () async {
+      final api = FakeApi(
+        seatScript: [room(free: {'1'})],
+        reserveScript: [_no('이미 배정된 좌석이 있어요')],
+        heldScript: [<MyCharge>[], <MyCharge>[], [_held('3')]],
+      );
+      final h = _Harness(api: api, replace: true);
+      final out = await h.run();
+      expect(out, isA<KeepingSeat>());
+      expect((out as KeepingSeat).held.seatCode, '3');
+      expect(api.reserveCalls, 1);
+    });
+
+    test('거절되고 정말 좌석이 없으면 예전처럼 계속 시도한다', () async {
+      final api = FakeApi(
+        seatScript: [room(free: {'1'})],
+        reserveScript: [_no('누가 먼저 앉았어요'), _ok],
+        heldScript: [<MyCharge>[]],
+      );
+      final h = _Harness(api: api, replace: true);
+      expect(await h.run(), isA<Reserved>());
+      expect(api.reserveCalls, 2);
+    });
+
+    test('실행 상태에 지금 갖고 있는 좌석 번호가 실려 화면이 "더 원하는 좌석을 기다리는 중"임을 알 수 있다', () async {
+      final api = FakeApi(
+        seatScript: [room(), room(), room(free: {'1'})],
+        reserveScript: [_ok],
+        heldScript: [[_held('3')]],
+      );
+      final h = _Harness(api: api, replace: true, wanted: ['1', '3']);
+      final out = await h.run();
+      expect(out, isA<Reserved>());
+      expect(h.statuses.first.heldCode, '3');
     });
 
     test('반납한 뒤 예약이 거절되면 원래 좌석을 다시 예약하고, 다시 시도할 때 또 묻지 않는다', () async {

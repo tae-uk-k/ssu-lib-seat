@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ui' show PlatformDispatcher;
 
+import 'package:dio/dio.dart' show DioException;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
@@ -10,9 +11,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
 import 'auto_renewer.dart';
+import 'keep_seat_page.dart';
 import 'my_seat_page.dart';
 import 'reservation_runner.dart';
 import 'run_state.dart';
+import 'seat_keeper.dart';
 import 'seat_layout.dart';
 import 'seat_map.dart';
 import 'services.dart';
@@ -139,6 +142,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// (시작하는 중에는 아직 예약 루프가 없어서, 배너가 무엇을 하는 실행인지 이 값으로 정한다).
   bool _huntRun = false;
 
+  /// 지금 내가 갖고 있다고 아는 좌석. 도면에서 다른 좌석과 색이 다르게 보인다.
+  /// 예약에 성공했을 때, 자동 연장이 내 좌석을 확인할 때, 좌석 목록을 불러올 때 알게 된다.
+  ({int? roomId, String code})? _mine;
+
+  // ---------- 좌석 유지 (메뉴의 "좌석 유지") ----------
+  SeatKeeper? _keeper; // 도는 중일 때만 있다
+  bool _keeping = false; // 시작하는 중, 도는 중, 끝나는 중 모두 true. 예약 실행과 겹치지 않게 막는 데 쓴다
+  final _keepStatus = ValueNotifier<KeepStatus?>(null);
+  KeepSettings _keepSettings = const KeepSettings();
+  String? _keepLastResult; // 가장 최근에 끝난 좌석 유지의 결과 한 줄 (좌석 유지 화면에 보인다)
+  bool _keepStoppedForReturn = false; // 좌석을 내놓으려고 좌석 유지를 멈췄다는 표시
+
+  /// 좌석을 노리는 예약만 멈췄다는 표시(좌석을 내놓으려고 하거나, "좌석 찾기만 멈추기"를 눌렀다). 이때는 자동 연장을 같이 멈추지 않는다.
+  bool _huntStoppedAlone = false;
+
+  /// 이번 실행에서 예약 루프가 좌석을 받고 끝났을 때 실행 배너에 보일 제목 ("12번 좌석 배정 완료").
+  /// 이후에는 자동 연장만 지켜보지만, 예약은 이미 끝났다는 것이 한눈에 보이게 한다.
+  String? _gotSeatTitle;
+
   /// 사용자가 내 좌석 화면에서 직접 반납한 뒤 연장 루프가 "좌석이 없어졌다"며 끝나는 경우, 이용이 끝났다는 안내를 또 띄우지 않으려는 표시.
   bool _returnedByUser = false;
   List<String> _crashes = [];
@@ -162,6 +184,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (r.id == _roomId) return r;
     }
     return null;
+  }
+
+  /// 지금 보고 있는 열람실에서 내가 갖고 있는 좌석 번호 (없거나 다른 열람실이면 null).
+  String? get _mineHere {
+    final m = _mine;
+    return m != null && m.roomId != null && m.roomId == _roomId ? m.code : null;
+  }
+
+  /// 갖고 있는 좌석을 기억한다 ([code] 가 null 이면 좌석이 없다). 바뀐 때만 화면을 다시 그린다.
+  void _setMine(int? roomId, String? code) {
+    final next = code == null ? null : (roomId: roomId, code: code);
+    if (_mine == next) return;
+    if (mounted) {
+      setState(() => _mine = next);
+    } else {
+      _mine = next;
+    }
   }
 
   @override
@@ -189,6 +228,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await widget.services.background.init();
     await widget.services.notifier.init();
     await _restore();
+    _keepSettings = await KeepSettings.load();
     unawaited(_autoLogin());
     unawaited(_loadLayout());
     unawaited(_loadRooms());
@@ -457,6 +497,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final p = await SharedPreferences.getInstance();
     await p.setBool('autoRenew', on);
     if (!mounted) return;
+    if (_keeping) {
+      // 좌석 유지는 시작할 때 정한 대로 돈다. 바뀐 값은 다음 좌석 유지부터 적용된다.
+      _toast('좌석 유지가 도는 중이에요. 바꾼 값은 다음에 좌석 유지를 시작할 때부터 적용돼요.');
+      return;
+    }
     if (_phase == _Phase.running) {
       if (on) {
         _spawnRenewer?.call();
@@ -504,12 +549,42 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 내 좌석 화면의 "반납하기"(이용 시작 전이면 "배정 취소"). 성공하면 null, 실패하면 화면에 보일 이유를 돌려준다.
   /// 반납은 되돌릴 수 없으므로 화면에서 확인을 받은 뒤에만 불린다. 도는 자동 연장은 좌석이 없어진 것을 바로 알아채고 끝난다.
   Future<String?> _returnSeat(MyCharge c) async {
-    final inUse = c.returnable;
-    final what = inUse ? '반납' : '배정 취소';
+    var target = c;
+    var inUse = target.returnable;
+    var what = inUse ? '반납' : '배정 취소';
     final label = '${c.roomName.isEmpty ? '' : '${c.roomName} '}${c.seatCode}번 좌석';
-    Future<Map<String, dynamic>> call(LibraryApi api) => inUse ? api.returnCharge(c.id) : api.cancelCharge(c.id);
+    Future<Map<String, dynamic>> call(LibraryApi api) => inUse ? api.returnCharge(target.id) : api.cancelCharge(target.id);
+
+    // 빈 좌석을 노리는 예약이 도는 중이면 먼저 멈춘다. 안 그러면 방금 내놓은 좌석이 비는 순간(또는 원하는 다른 좌석) 곧바로 다시 잡아서
+    // "취소해도 다시 배정된다"로 보인다. 자동 연장은 그대로 둔다 (내놓기가 거절돼 좌석이 남으면 계속 연장해야 한다).
+    final hunter = _runner;
+    final pausedHunt = hunter != null;
+    if (hunter != null) {
+      _huntStoppedAlone = true;
+      hunter.stop();
+      _log('좌석을 내놓는 동안 다시 잡지 않도록 좌석을 노리는 예약을 멈췄어요');
+    }
+    // 좌석 유지도 마찬가지다: 내놓은 좌석을 곧바로 다시 예약해 버리므로 먼저 멈춘다.
+    final keeper = _keeper;
+    final pausedKeep = keeper != null;
+    if (keeper != null) {
+      _keepStoppedForReturn = true;
+      keeper.stop();
+      _log('좌석을 내놓는 동안 다시 예약하지 않도록 좌석 유지를 멈췄어요');
+    }
+    final huntNote = '${pausedHunt ? ' 좌석을 노리던 예약은 멈춘 상태예요. 필요하면 다시 시작해 주세요.' : ''}'
+        '${pausedKeep ? ' 좌석 유지는 멈춘 상태예요. 필요하면 다시 시작해 주세요.' : ''}';
+
     _log('$label $what 요청');
     try {
+      // 화면에 보이던 상태는 오래됐을 수 있다 (그사이 이용이 시작돼 반납해야 하는 좌석이 됐거나, 이미 사라졌을 수 있다).
+      // 지금 상태를 다시 읽어 그에 맞는 요청을 보낸다. 읽지 못하면 화면에 보이던 대로 보낸다.
+      target = await _freshCharge(c);
+      if (target.returnable != c.returnable) {
+        inUse = target.returnable;
+        what = inUse ? '반납' : '배정 취소';
+        _log('$label 은 그사이 상태가 바뀌어 $what 으로 처리해요');
+      }
       var res = await call(_api);
       if (res['code'] == 'error.authentication.needLogin' && _hasAccount) {
         _log('$what 중 로그인이 풀려 다시 로그인해요');
@@ -518,21 +593,44 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (res['success'] == true) {
         _log('$label $what 완료');
         _returnedByUser = true;
+        _setMine(null, null); // 내놓은 좌석은 더 이상 내 좌석이 아니다
         _renewer?.nudge(); // 좌석이 없어진 것을 기다리지 않고 바로 확인하게 한다
-        _toast(inUse ? '$label을 반납했어요.' : '$label 배정을 취소했어요.');
+        _toast('${inUse ? '$label을 반납했어요.' : '$label 배정을 취소했어요.'}${pausedHunt ? ' 좌석을 노리던 예약도 멈췄어요.' : ''}${pausedKeep ? ' 좌석 유지도 멈췄어요.' : ''}');
         return null;
       }
       final msg = '${res['code'] ?? ''} ${res['message'] ?? ''}'.trim();
       _log('$what 실패: ${msg.isEmpty ? '서버가 거절했어요' : msg}');
-      return '$what하지 못했어요. ${msg.isEmpty ? '서버가 거절했어요.' : msg}';
+      return '$what하지 못했어요. ${msg.isEmpty ? '서버가 거절했어요.' : msg}$huntNote';
     } on LoginException catch (e) {
       _log('$what 실패: 로그인이 거절됐어요 (${e.message})');
-      return '로그인이 풀렸는데 다시 로그인하지 못했어요. 학번과 비밀번호를 확인해 주세요.';
+      return '로그인이 풀렸는데 다시 로그인하지 못했어요. 학번과 비밀번호를 확인해 주세요.$huntNote';
     } catch (e) {
       // 요청이 서버에 닿은 뒤 응답만 못 받았을 수도 있다. 새로고침으로 확인하라고 알려 준다.
       _log('$what 중 오류: $e');
-      return '서버와 연결이 불안정해요. $what이 처리됐을 수도 있으니 새로고침(↻)으로 확인해 주세요.';
+      return '서버와 연결이 불안정해요. $what이 처리됐을 수도 있으니 새로고침(↻)으로 확인해 주세요. (${_briefError(e)})$huntNote';
     }
+  }
+
+  /// 반납·취소 직전에 서버에서 이 좌석의 지금 상태를 다시 읽는다. 읽지 못하거나 목록에 없으면 화면에 보이던 값을 그대로 쓴다
+  /// (없어졌어도 요청은 보내고, 서버가 알려 주는 이유를 그대로 보여 준다).
+  Future<MyCharge> _freshCharge(MyCharge c) async {
+    try {
+      final list = await _loadMine();
+      for (final x in list) {
+        if (x.id == c.id) return x;
+      }
+      for (final x in list) {
+        if (x.roomId == c.roomId && x.seatCode == c.seatCode) return x; // 예약 번호가 바뀐 같은 좌석
+      }
+    } catch (_) {}
+    return c;
+  }
+
+  /// 화면에 덧붙일 짧은 오류 설명 (어디서 막혔는지 알 수 있게).
+  String _briefError(Object e) {
+    final s = e is DioException ? (e.message ?? e.type.name) : (e is ApiException ? e.message : '$e');
+    final one = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return one.length > 80 ? '${one.substring(0, 80)}…' : one;
   }
 
   /// 내 좌석 화면이 서버에서 내 좌석을 읽어 올 때 쓴다. 로그인이 풀렸으면 저장된 계정으로 한 번 다시 로그인한다.
@@ -554,13 +652,40 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// 내 좌석 화면의 "도서관 안 확인". 서버에 도착 확인(게이트)을 한 번 묻고 결과를 돌려준다 (자동 연장이 연장 직전에 하는 것과 같은 확인).
+  /// 읽기만 하는 요청이다. 좌석이 없어도 되므로 열람실은 갖고 있는 좌석의 것, 없으면 고른 열람실을 쓴다.
+  /// 로그인이 풀렸으면 저장된 계정으로 한 번 다시 로그인한다. 실패하면 예외를 그대로 던져 화면이 안내한다.
+  Future<ArrivalCheck> _checkArrival(int? roomHint) async {
+    final roomId = roomHint ?? _roomId ?? _defaultRoomId;
+    Future<ArrivalCheck> ask(LibraryApi api) => api.arrivalCheck(roomId, 'GATE');
+    try {
+      ArrivalCheck r;
+      try {
+        r = await ask(_api);
+      } on SessionException catch (e) {
+        if (!_hasAccount) rethrow;
+        _log('도서관 안 확인 중 로그인이 풀려 다시 로그인해요 (${e.message})');
+        r = await ask(await _relogin());
+      }
+      final detail = '${r.code} ${r.message}'.trim();
+      _log('도서관 안 확인($roomId번 열람실): ${r.confirmed ? '안에 있는 것으로 확인됨' : (r.accepted ? '확인되지 않음' : '서버가 거절함')}'
+          '${detail.isEmpty ? '' : ' [$detail]'}');
+      return r;
+    } catch (e) {
+      _log('도서관 안 확인 실패: $e');
+      rethrow;
+    }
+  }
+
   RenewView _renewView() => RenewView(
         enabled: _autoRenew,
         active: _renewer != null,
-        sessionRunning: _running,
+        sessionRunning: _running || _keeping,
         threshold: widget.services.renewPolicy.threshold,
         retryAfter: widget.services.renewPolicy.retryAfter,
         status: _renewer != null ? _renewStatus.value : null,
+        hunting: _runner != null,
+        keeping: _keeping,
       );
 
   /// 자동 연장이 지금 어떤지 한 줄로 (메뉴에 보인다).
@@ -579,6 +704,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           onStart: () => _start(renewOnly: true),
           onLogin: _login,
           onReturn: _returnSeat,
+          onCheckArrival: _checkArrival,
         ),
       ),
     ));
@@ -652,7 +778,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _login({bool auto = false}) async {
-    if (_loggingIn || _running) return;
+    if (_loggingIn || _running || _keeping) return;
     if (_id.text.trim().isEmpty || _pw.text.isEmpty) {
       if (!auto) _toast('학번과 비밀번호를 입력해 주세요.');
       return;
@@ -759,6 +885,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       });
       _log('${_room?.name ?? '열람실'} 좌석 ${seats.length}개를 불러왔어요');
       if (seats.isEmpty) _toast('이 열람실에는 좌석이 없어요.');
+      unawaited(_rememberMySeat());
     } on SessionException catch (e) {
       _log('좌석을 불러오지 못했어요 (로그인이 풀린 것 같아요): ${e.message}');
       _toast('좌석을 불러오지 못했어요. 다시 로그인해 보세요. (${e.message})');
@@ -768,6 +895,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } finally {
       if (mounted) setState(() => _loadingSeats = false);
     }
+  }
+
+  /// 좌석 목록을 불러올 때 내 좌석도 한 번 읽어 와서 도면에 색으로 보인다 (읽기만 한다).
+  /// 도는 중에는 예약·연장 루프가 알려 주므로 건너뛴다. 실패해도 조용히 넘어간다 (도면 색만 안 보일 뿐이다).
+  Future<void> _rememberMySeat() async {
+    if (_running || !_loggedIn) return;
+    try {
+      final mine = await _api.myCharges();
+      if (!mounted || _running) return;
+      final first = mine.isEmpty ? null : mine.first;
+      _setMine(first?.roomId, first?.seatCode);
+    } catch (_) {}
   }
 
   void _toggle(Seat s) {
@@ -789,6 +928,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           layout: layout,
           seats: _seatsApi,
           selected: _selected,
+          mine: _mineHere,
           onTap: (s) {
             _toggle(s);
             setInner(() {});
@@ -829,6 +969,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// [renewOnly] 이면 좌석을 고른 것과 상관없이 "이미 갖고 있는 좌석의 연장"만 지켜본다.
   Future<void> _start({bool renewOnly = false}) async {
     if (_phase != _Phase.idle) return; // 연타하거나 멈추는 중에 눌러도 한 번만 시작한다
+    if (_keeping) {
+      _toast('좌석 유지가 도는 중이에요. 메뉴의 좌석 유지에서 먼저 중지해 주세요.');
+      return;
+    }
     if (renewOnly && !_autoRenew) return;
     // 좌석을 골랐으면 예약 루프를 돌린다. 안 골랐어도 자동 연장이 켜져 있으면 "이미 갖고 있는 좌석의 연장"만 한다.
     final hunt = !renewOnly && _selected.isNotEmpty;
@@ -860,6 +1004,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() {
       _phase = _Phase.starting;
       _huntRun = hunt;
+      _gotSeatTitle = null;
+      _huntStoppedAlone = false;
       _returnedByUser = false;
       _lastResult = null;
       _lastBeat = null;
@@ -894,7 +1040,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _log('좌석 예약 없이 내 좌석의 연장만 지켜봐요');
       }
       _log(_autoRenew
-          ? '자동 연장 켜짐: 이용 종료 ${renewPolicy.threshold.inMinutes}분 전부터 연장하고, 안 되면 ${renewPolicy.retryAfter.inMinutes}분 뒤 다시 시도해요'
+          ? '자동 연장 켜짐: 이용 종료 ${renewPolicy.threshold.inMinutes}분 전까지는 내 좌석을 다시 조회하지 않고, 그때부터 연장해요. 안 되면 ${renewPolicy.retryAfter.inMinutes}분 뒤 다시 시도해요'
           : '자동 연장 꺼짐');
       if (!_batteryOk) _log('배터리 제한이 켜져 있어요. 화면을 오래 끄면 멈출 수 있으니 메뉴에서 풀어 주세요.');
       // 예약 루프와 연장 루프가 같은 로그인을 나눠 쓴다 (서로의 로그인을 끊지 않게).
@@ -937,16 +1083,38 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           final o = await hunter.run();
           huntOutcome = o;
           _runner = null;
+          _huntRun = false; // 예약 루프는 끝났다. 이제 이 실행은 갖고 있는 좌석의 연장만 지켜본다
+          // 좌석을 받았으면 도면에서 내 좌석 색이 바뀌고, 실행 배너가 "배정 완료"로 바뀐다 (계속 "예약 중"처럼 보이지 않게).
+          switch (o) {
+            case Reserved(:final seat):
+              _gotSeatTitle = '${seat.code}번 좌석 배정 완료';
+              _setMine(roomId, seat.code);
+            case KeepingSeat(:final held, :final best):
+              _gotSeatTitle = best ? '${held.seatCode}번 좌석을 이미 갖고 있어요' : '${held.seatCode}번 좌석이 배정돼 있어요';
+              _setMine(held.roomId, held.seatCode);
+            case ReplaceFailed(:final old, restored: true):
+              _setMine(old.roomId, old.seatCode); // 바꾸지 못하고 원래 좌석을 되찾았다
+            default:
+          }
+          _lastNotif = null; // 알림줄 문구("좌석 예약 실행 중")를 기다리지 않고 바로 고치게 한다
           if (mounted) setState(() {}); // 실행 배너가 "연장만 지켜보는 중"으로 바뀌도록
           // 좌석을 갖게 됐거나 (좌석 바꾸기를 "아니요" 해서) 갖고 있는 좌석을 그대로 두기로 했으면, 자동 연장이 켜져 있는 한 끝내지 않고
           // 연장을 이어 간다. 사용자가 직접 멈췄거나 실패한 경우는 연장도 같이 끝낸다.
           // (지금 연장을 지켜보고 있는지는 이 시점의 값을 본다. 실행 중에 스위치를 켜거나 껐을 수 있다.)
           final declined = o is Stopped && !hunter.isStopped;
+          // 좌석을 내놓으려고(반납·취소) 예약만 멈춘 경우: 연장은 그대로 둔다. 내놓기가 거절돼 좌석이 남아 있으면 계속 연장해야 하고,
+          // 성공했으면 연장 루프가 좌석이 없어진 것을 보고 스스로 끝난다.
+          final pausedForReturn = o is Stopped && _huntStoppedAlone;
           final w = _renewer;
           if (w != null && (o is Reserved || o is KeepingSeat || declined)) {
             huntAnnounced = true;
             w.nudge(); // 좌석이 있으니 기다리지 말고 바로 확인한다
             if (!declined && mounted) unawaited(_announceHunt(o, roomName));
+          } else if (pausedForReturn) {
+            if (w != null) {
+              huntAnnounced = true; // 예약 쪽은 알릴 것이 없다. 끝날 때는 연장이 끝난 이유를 알린다
+              w.nudge();
+            }
           } else {
             _renewer?.stop();
           }
@@ -1032,6 +1200,305 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _renewer?.stop();
   }
 
+  /// 이미 갖고 있는 좌석은 그대로 두고, 더 원하는 좌석을 찾는 예약만 멈춘다. 자동 연장이 켜져 있으면 그대로 이어 간다.
+  void _stopHuntOnly() {
+    final hunter = _runner;
+    if (_phase != _Phase.running || hunter == null) return;
+    _log('좌석 찾기만 멈췄어요 (갖고 있는 좌석${_renewer != null ? '과 자동 연장' : ''}은 그대로)');
+    _huntStoppedAlone = true;
+    hunter.stop();
+  }
+
+  // ---------- 좌석 유지 ----------
+
+  /// 좌석 유지 화면에서 열람실의 좌석을 읽어 온다 (API 순서 그대로). 로그인이 풀렸으면 저장된 계정으로 한 번 다시 로그인한다.
+  Future<List<Seat>> _loadSeatsFor(int roomId) async {
+    try {
+      return await _api.seats(roomId);
+    } on SessionException {
+      if (!_hasAccount) rethrow;
+      return await (await _relogin()).seats(roomId);
+    }
+  }
+
+  void _openKeepSeat({bool fromMenu = false}) {
+    if (fromMenu) Navigator.pop(context); // 메뉴를 닫는다
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => ListenableBuilder(
+        listenable: _uiTick,
+        builder: (context, _) => KeepSeatPage(
+          loggedIn: _loggedIn,
+          rooms: [for (final r in _rooms) if (r.chargeable) r],
+          status: _keepStatus,
+          running: _keeping,
+          initial: _keepSettings,
+          loadSeats: _loadSeatsFor,
+          loadLayout: widget.services.layoutFor,
+          onStart: _startKeep,
+          onStop: _stopKeep,
+          onLogin: _login,
+          onSave: (s) {
+            _keepSettings = s;
+            unawaited(s.save());
+          },
+          blockedReason: _running ? '예약이 도는 중이라 시작할 수 없어요. 먼저 메인 화면에서 중지해 주세요.' : null,
+          autoRenewOn: _autoRenew,
+          lastResult: _keepLastResult,
+        ),
+      ),
+    ));
+  }
+
+  /// 좌석 유지를 시작한다: 고른 좌석을 예약해 두고, 사라지면 다시 예약한다. 멈추거나 종료 시각이 될 때까지 이 함수는 끝나지 않는다.
+  /// 이용 중인 좌석을 끝나기 전에 연장하는 자동 연장도 (켜져 있으면) 함께 돈다.
+  Future<void> _startKeep(KeepSettings s) async {
+    if (_keeping) return;
+    if (_running) {
+      _toast('예약이 도는 중이에요. 먼저 메인 화면에서 중지해 주세요.');
+      return;
+    }
+    final roomId = s.roomId;
+    if (!_loggedIn || !_hasAccount) {
+      _toast('먼저 로그인해 주세요.');
+      return;
+    }
+    if (roomId == null || s.seats.isEmpty) {
+      _toast('열람실과 좌석을 골라 주세요.');
+      return;
+    }
+    final roomName = _rooms.where((r) => r.id == roomId).map((r) => r.name).firstOrNull ?? '열람실';
+    final uid = _id.text.trim();
+    final pw = _pw.text;
+    final sec = double.tryParse(_interval.text.trim()) ?? 1.5;
+    final interval = Duration(milliseconds: (sec.clamp(_minIntervalSec, 60) * 1000).round());
+    final endAt = s.endAtFrom(DateTime.now());
+    _keepSettings = s;
+    unawaited(s.save());
+    _keepStatus.value = null;
+    setState(() {
+      _keeping = true;
+      _keepLastResult = null;
+      _lastResult = null;
+      _returnedByUser = false;
+      _keepStoppedForReturn = false;
+      _lastBeat = null;
+      _lastNotif = null;
+      _lastServiceText = null;
+    });
+    final bg = widget.services.background;
+    KeepOutcome? outcome;
+    Object? setupError;
+    SeatKeeper? keeper;
+    SeatRenewer? renewer;
+    Future<void>? renewTask;
+    try {
+      await bg.requestPermission();
+      final serviceUp = await bg.start(title: '좌석 유지 실행 중', text: '$roomName · ${s.seats.length}개 좌석');
+      _log(serviceUp ? '백그라운드 서비스를 시작했어요' : '백그라운드 서비스를 시작하지 못했어요');
+      if (!serviceUp) _toast('백그라운드 실행을 시작하지 못했어요. 앱을 켜 둔 채로 사용해 주세요.');
+      await RunMarker.begin('좌석 유지 · $roomName', s.seats.length);
+      _log('좌석 유지 시작: $roomName · 좌석 ${s.seats.join(', ')}${endAt == null ? ' · 끝나는 시각 없음' : ' · ${_hm(endAt)}까지'}');
+      // 좌석 유지와 자동 연장이 같은 로그인을 나눠 쓴다 (서로의 로그인을 끊지 않게).
+      final shared = SharedLogin(() async {
+        final api = widget.services.newApi();
+        await api.login(uid, pw);
+        _api = api;
+        if (mounted) setState(() => _loggedIn = true);
+        return api;
+      });
+      if (_autoRenew) {
+        final w = SeatRenewer(
+          policy: widget.services.renewPolicy,
+          api: _loggedIn ? _api : null,
+          login: shared.call,
+          onLog: _log,
+          onStatus: _onRenewStatus,
+          onEvent: _onRenewEvent,
+          isEnvironmentAlive: serviceUp ? bg.isAlive : null,
+          waitForSeat: () => true, // 좌석이 사라져도 끝내지 않고, 좌석 유지가 새로 잡으면 이어서 지켜본다
+        );
+        renewer = w;
+        _renewer = w;
+        renewTask = w.run().then<void>((o) {
+          if (identical(_renewer, w)) _renewer = null;
+          _log('자동 연장이 끝났어요 (${o.reason.name})');
+          if (mounted) setState(() {});
+        });
+      }
+      final k = SeatKeeper(
+        roomId: roomId,
+        wanted: List<String>.of(s.seats),
+        runPolicy: widget.services.policyFor(interval),
+        policy: widget.services.keepPolicy,
+        login: shared.call,
+        api: _api,
+        onLog: _log,
+        onStatus: _onKeepStatus,
+        onEvent: _onKeepEvent,
+        endAt: endAt,
+        cancelAtEnd: s.cancelAtEnd,
+        isEnvironmentAlive: serviceUp ? bg.isAlive : null,
+        onSeatChanged: () => _renewer?.nudge(), // 새 좌석을 자동 연장이 바로 보게 한다
+      );
+      keeper = k;
+      _keeper = k;
+      if (!mounted) k.stop();
+      outcome = await k.run();
+    } catch (e) {
+      setupError = e;
+    } finally {
+      keeper?.stop();
+      renewer?.stop();
+      if (renewTask != null) {
+        try {
+          await renewTask.timeout(const Duration(seconds: 5));
+        } catch (_) {}
+      }
+      _keeper = null;
+      _renewer = null;
+      await RunMarker.end();
+      await bg.stop();
+      _log('백그라운드 서비스를 정리했어요');
+    }
+    if (!mounted) return;
+    await _finishKeep(outcome, setupError);
+  }
+
+  void _stopKeep() {
+    final k = _keeper;
+    if (k == null) return;
+    _log('좌석 유지 중지를 눌렀어요');
+    k.stop();
+  }
+
+  /// 좌석 유지가 확인할 때마다 불린다. 상태 화면과 도면의 내 좌석 색, 알림 문구를 고친다.
+  void _onKeepStatus(KeepStatus s) {
+    if (!mounted) return;
+    _keepStatus.value = s;
+    _setMine(s.held?.roomId, s.held?.seatCode);
+    final now = DateTime.now();
+    _beat(now);
+    final held = s.held;
+    _setServiceText(
+      '좌석 유지 중',
+      held == null
+          ? '좌석을 다시 예약하는 중 (${_hm(now)})'
+          : '${held.seatCode}번 좌석 · ${held.returnable ? '이용 중' : '배정만 됨'} · 다시 예약 ${s.reserved}번 (${_hm(now)})',
+      now,
+    );
+  }
+
+  /// 좌석을 다시 잡지 못하고 있을 때만 알린다 (앱이 보이면 잠깐 뜨는 안내, 안 보이면 시스템 알림). 재예약 성공은 화면과 기록에 남기고 알리지 않는다.
+  void _onKeepEvent(KeepEvent e) {
+    if (!mounted || e.kind != KeepEventKind.trouble) return;
+    const title = '좌석을 다시 잡지 못하고 있어요';
+    if (widget.services.desktop || !_inForeground) {
+      unawaited(widget.services.notifier.show(title: title, body: e.message));
+    } else {
+      _toast('$title ${e.message}');
+    }
+  }
+
+  Future<void> _finishKeep(KeepOutcome? o, Object? setupError) async {
+    final lastHeld = _keepStatus.value?.held;
+    final forReturn = _keepStoppedForReturn;
+    String summary;
+    _Notice? notice;
+    String? loginRejected;
+    Object? crash;
+    if (o == null) {
+      crash = setupError ?? '좌석 유지를 시작하지 못했어요';
+      summary = '좌석 유지를 시작하지 못했어요.';
+      notice = _Notice(title: '좌석 유지를 시작하지 못했어요', body: '$crash');
+    } else {
+      switch (o.reason) {
+        case KeepEndReason.stopped:
+          summary = '좌석 유지를 멈췄어요 (다시 예약 ${o.reserved}번).';
+        case KeepEndReason.timeUp:
+          summary = '정한 시각이 돼서 좌석 유지를 마쳤어요 (다시 예약 ${o.reserved}번).';
+          notice = _Notice(
+            good: true,
+            title: '좌석 유지를 마쳤어요',
+            body: '정한 종료 시각이 돼서 멈췄어요. 이번 실행에서 ${o.reserved}번 예약했어요.${o.cancelledAtEnd ? ' 배정만 된 좌석은 취소했어요.' : ''}',
+          );
+        case KeepEndReason.loginRejected:
+          summary = '로그인에 실패해 좌석 유지를 멈췄어요.';
+          loginRejected = o.message;
+          notice = const _Notice(
+            title: '로그인에 실패해 좌석 유지를 멈췄어요',
+            body: '학번 또는 비밀번호가 올바르지 않아요. 여러 번 틀리면 5분간 로그인이 막히니, 도서관 홈페이지에서 먼저 로그인해 보고 다시 시도해 주세요.',
+          );
+        case KeepEndReason.environmentLost:
+          summary = '백그라운드 실행이 끝나 좌석 유지를 멈췄어요.';
+          notice = const _Notice(title: '백그라운드 실행이 끝나 좌석 유지를 멈췄어요', body: '시스템이 서비스를 종료했어요. 앱을 열고 다시 시작해 주세요.');
+        case KeepEndReason.crashed:
+          summary = '오류로 좌석 유지가 멈췄어요.';
+          crash = o.error ?? o.message;
+          notice = _Notice(title: '오류로 좌석 유지가 멈췄어요', body: o.message);
+      }
+    }
+    if (crash != null) unawaited(CrashLog.record(crash, null));
+    _log(notice?.title ?? summary);
+    setState(() {
+      _keeping = false;
+      _keepLastResult = summary;
+      _lastResult = notice;
+      if (loginRejected != null) _loggedIn = false; // 다시 로그인하도록
+    });
+    _keepStatus.value = null;
+    if (loginRejected != null) {
+      _setMine(null, null);
+      unawaited(widget.services.secure.write(_autoLoginBlocked, '1')); // 저장된 계정이 틀렸다
+    } else if (o != null && o.cancelledAtEnd) {
+      _setMine(null, null);
+    }
+    if (notice == null) {
+      // 사용자가 멈췄다. 좌석은 건드리지 않았으니, 배정만 된 좌석이 남아 있으면 알려 준다 (그대로 두면 정해진 시간 뒤에 풀린다).
+      if (!forReturn) {
+        _toast(lastHeld != null && !lastHeld.returnable
+            ? '좌석 유지를 멈췄어요. ${lastHeld.seatCode}번 좌석은 배정만 된 상태예요. 필요 없으면 내 좌석에서 취소해 주세요.'
+            : '좌석 유지를 멈췄어요.');
+      }
+      return;
+    }
+    await _tell(notice, loginRejectedMessage: loginRejected);
+  }
+
+  Widget _keepBanner() {
+    final scheme = Theme.of(context).colorScheme;
+    final fg = scheme.onPrimaryContainer;
+    return GestureDetector(
+      onTap: _openKeepSeat,
+      child: BannerCard(
+        color: scheme.primaryContainer,
+        leading: Icon(Icons.push_pin, size: 22, color: fg),
+        trailing: Icon(Icons.chevron_right, color: fg),
+        child: ValueListenableBuilder<KeepStatus?>(
+          valueListenable: _keepStatus,
+          builder: (context, s, _) {
+            final held = s?.held;
+            return Column(crossAxisAlignment: CrossAxisAlignment.start, spacing: 3, children: [
+              Text('좌석 유지 중', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: fg)),
+              Text(
+                  held == null
+                      ? '좌석을 다시 예약하는 중이에요'
+                      : '${held.seatCode}번 좌석 · ${held.returnable ? '이용 중' : '배정만 된 상태'} · 다시 예약 ${s!.reserved}번',
+                  style: TextStyle(fontSize: 12.5, color: fg)),
+              Text('눌러서 자세히 보기', style: TextStyle(fontSize: 12, color: fg.withValues(alpha: 0.8))),
+            ]);
+          },
+        ),
+      ),
+    );
+  }
+
+  /// 메뉴에 한 줄로 보이는 좌석 유지 상태.
+  String _keepSummary() {
+    if (!_keeping) return '꺼짐';
+    final held = _keepStatus.value?.held;
+    return held == null ? '동작 중 · 좌석을 다시 예약하는 중' : '동작 중 · ${held.seatCode}번 좌석';
+  }
+
   /// "살아 있음" 기록을 남기는 간격과, 알림 문구를 고치는 최소 간격. 조회는 1~2초마다 오지만 이 정도면 충분하다.
   static const _beatEvery = Duration(seconds: 60);
 
@@ -1066,6 +1533,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void _onRunStatus(RunStatus s, String roomName) {
     if (!mounted) return;
     _runStatus.value = s;
+    final heldHere = s.heldCode;
+    if (heldHere != null && _roomId != null) _setMine(_roomId, heldHere); // 도면에 내 좌석 색으로 보이게
     if (s.seats.isNotEmpty && !_sameSeats(_seatsApi, s.seats)) {
       setState(() {
         _seatsApi = s.seats;
@@ -1083,11 +1552,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void _onRenewStatus(RenewStatus s) {
     if (!mounted) return;
     _renewStatus.value = s;
+    _setMine(s.held?.roomId, s.held?.seatCode); // 도면에서 내 좌석 색이 바뀌도록
     if (s.held != null) _returnedByUser = false; // 반납한 뒤 새 좌석을 받았다면 그 좌석은 평소처럼 알린다
     final now = DateTime.now();
     _beat(now);
-    // 예약 루프가 도는 동안은 거기서 알림 문구를 정한다. 연장만 지켜보는 중일 때만 여기서 정한다.
-    if (_runner != null) return;
+    // 예약 루프나 좌석 유지가 도는 동안은 거기서 알림 문구를 정한다. 연장만 지켜보는 중일 때만 여기서 정한다.
+    if (_runner != null || _keeping) return;
     final held = s.held;
     final rem = held?.remainingMinutes;
     final shaky = s.errorStreak > 0 ? ' · 서버 응답 불안정' : '';
@@ -1144,12 +1614,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           title: '${seat.code}번 좌석 예약이 계속 거절돼 멈췄어요',
           body: '$message\n이미 좌석을 배정받았거나 이용 제한 중일 수 있어요. 도서관 홈페이지에서 확인해 주세요.',
         ),
-      KeepingSeat(:final held) => _Notice(
+      KeepingSeat(:final held, best: true) => _Notice(
           good: true,
           title: '이미 가장 원하는 좌석이에요',
           body: watching
               ? '${held.roomName} ${held.seatCode}번 좌석을 이미 갖고 있어요. 더 바꿀 좌석이 없어서 예약은 마치고, 자동 연장만 계속해요.'
               : '${held.roomName} ${held.seatCode}번 좌석을 이미 갖고 있어요. 더 바꿀 좌석이 없어서 멈췄어요.',
+        ),
+      // 예약 요청의 응답을 받지 못했거나 다른 곳(홈페이지)에서 잡은 좌석이 이미 있어서 더 예약하지 않고 마친 경우
+      KeepingSeat(:final held) => _Notice(
+          good: true,
+          title: '좌석이 이미 배정돼 있어요',
+          body: '${held.roomName} ${held.seatCode}번 좌석이 이미 배정돼 있어서 더 예약하지 않고 마쳤어요. '
+              '(예약 요청의 응답을 받지 못했거나, 다른 곳에서 예약한 좌석이에요.)'
+              '${watching ? ' 자동 연장만 계속해요.' : ''}',
         ),
       ReplaceFailed(:final wanted, :final old, :final restored, :final message) => _Notice(
           title: restored ? '${wanted.code}번으로 바꾸지 못했어요' : '좌석을 바꾸다 실패했어요',
@@ -1174,6 +1652,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return switch (o.reason) {
       RenewEndReason.stopped => null,
       RenewEndReason.seatEnded when _returnedByUser => null, // 직접 반납했으니 "이용이 끝났어요"를 또 알리지 않는다
+      // 이용을 시작하기 전(배정만 된 상태)에 사라졌다: 시간 안에 도서관 안에서 배정확정을 못 했거나 다른 곳에서 취소했을 수 있다.
+      RenewEndReason.seatEnded when o.lastSeat != null && !o.lastSeat!.returnable => _Notice(
+          title: '배정된 좌석이 사라졌어요',
+          body: '${seat ?? ''}번 좌석이 이용을 시작하기 전에 없어졌어요. 정해진 시간 안에 도서관 안에서 배정확정을 하지 않았거나, '
+              '다른 곳에서 취소했을 수 있어요. 도서관 홈페이지에서 확인해 주세요.',
+        ),
       RenewEndReason.seatEnded => o.failing
           ? _Notice(
               title: '연장하지 못한 채 이용이 끝났어요',
@@ -1271,6 +1755,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _phase = _Phase.idle;
       _lastResult = notice;
       if (loginRejected != null) _loggedIn = false; // 다시 로그인하도록
+      // 좌석 이용이 끝났거나 계정이 거절됐으면 더는 내 좌석으로 보이지 않는다 (사용자가 멈춘 것이면 좌석은 그대로다).
+      final ended = renew?.reason;
+      if (loginRejected != null || ended == RenewEndReason.seatEnded || ended == RenewEndReason.noSeat) _mine = null;
     });
     if (loginRejected != null) unawaited(widget.services.secure.write(_autoLoginBlocked, '1')); // 저장된 계정이 틀렸다
     if (notice == null) return;
@@ -1317,11 +1804,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _runner?.stop();
     _renewer?.stop();
+    _keeper?.stop();
     _id.dispose();
     _pw.dispose();
     _interval.dispose();
     _runStatus.dispose();
     _renewStatus.dispose();
+    _keepStatus.dispose();
     CrashLog.listener = null;
     _runLog.dispose();
     _uiTick.dispose();
@@ -1411,6 +1900,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               subtitle: Text(_renewSummary()),
               onTap: () => _openMySeat(fromMenu: true),
             ),
+            ListTile(
+              leading: Icon(_keeping ? Icons.push_pin : Icons.push_pin_outlined, color: _keeping ? kGreen : null),
+              title: const Text('좌석 유지'),
+              subtitle: Text(_keepSummary()),
+              onTap: () => _openKeepSeat(fromMenu: true),
+            ),
             ListTile(leading: const Icon(Icons.history), title: const Text('진행 기록'), onTap: _openLog),
             ListTile(
               leading: const Icon(Icons.timer_outlined),
@@ -1487,11 +1982,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     progress: _updateProgress,
                     busy: _updating,
                     // 스스로 바꿀 수 있는 컴퓨터(Windows)는 폰과 같은 모양(업데이트 버튼, 진행 표시, 예약 중에는 막음)이다.
-                    blocked: _running && (!widget.services.desktop || _canAutoInstall),
+                    blocked: (_running || _keeping) && (!widget.services.desktop || _canAutoInstall),
                     desktop: widget.services.desktop && !_canAutoInstall,
                     onUpdate: _installUpdate,
                   ),
                 if (_lastResult != null && !_running) _resultCard(_lastResult!),
+                if (_keeping) _keepBanner(),
                 if (_running) _runningBanner(),
                 _loginStep(),
                 _roomStep(),
@@ -1508,9 +2004,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget _runningBanner() {
     final scheme = Theme.of(context).colorScheme;
     final fg = scheme.onPrimaryContainer;
+    // 이번 실행에서 좌석을 받고 자동 연장만 이어 가는 중이면 "찾는 중" 표시(돌아가는 아이콘) 대신 배정 완료를 보인다.
+    final gotSeat = _phase == _Phase.running && _runner == null && _renewer != null ? _gotSeatTitle : null;
     return BannerCard(
       color: scheme.primaryContainer,
-      leading: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.4, color: fg)),
+      leading: gotSeat != null
+          ? const Icon(Icons.check_circle, color: kGreen)
+          : SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.4, color: fg)),
       // 조회마다 바뀌는 값은 여기만 다시 그린다 (화면 전체를 다시 그리지 않는다).
       child: ListenableBuilder(
         listenable: Listenable.merge([_runStatus, _renewStatus]),
@@ -1527,7 +2027,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               final title = switch (_phase) {
                 _Phase.starting => watching ? '자동 연장을 시작하는 중이에요' : '예약을 시작하는 중이에요',
                 _Phase.stopping => '멈추는 중이에요',
-                _ => watching ? '자동 연장을 지켜보는 중이에요' : '빈 좌석을 찾는 중이에요',
+                _ => watching ? (gotSeat ?? '자동 연장을 지켜보는 중이에요') : '빈 좌석을 찾는 중이에요',
               };
               return Column(crossAxisAlignment: CrossAxisAlignment.start, spacing: 3, children: [
                 Text(title, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: fg)),
@@ -1539,6 +2039,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 if (!watching && s != null && s.errorStreak > 0)
                   Text('서버 응답이 불안정해요 (${s.errorStreak}번째 재시도). 자동으로 계속 시도해요.',
                       style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: scheme.error)),
+                // 이미 좌석이 있는데도 도는 이유: 사용자가 "바꾸기"를 해서 더 원하는 좌석이 나기를 기다리는 중이다.
+                if (!watching && s?.heldCode != null)
+                  Text('지금 ${s!.heldCode}번 좌석을 갖고 있어요. 더 원하는 좌석이 나면 바꿔요.'.keepWords,
+                      style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: fg)),
                 if (!watching && soonest != null)
                   Text('가장 빨리 비는 좌석: ${soonest.code}번 (이용 종료까지 ${longRemaining(soonest.remainingMinutes!)})',
                       style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: fg)),
@@ -1626,7 +2130,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         subtitle: '${_id.text.trim()} 님으로 로그인됨',
         done: true,
         trailing: TextButton(
-          onPressed: _running ? null : () => setState(() => _loggedIn = false),
+          onPressed: _running
+              ? null
+              : () => setState(() {
+                    _loggedIn = false;
+                    _mine = null; // 다른 계정으로 로그인할 수 있다
+                  }),
           child: const Text('변경'),
         ),
         child: const SizedBox.shrink(),
@@ -1728,7 +2237,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } else if (_layout case final layout?) {
       // 도면이 있는 열람실: 작은 미리보기와, 크게 열어 고르는 버튼만 둔다 (범례·설명·고르기 도구는 크게 연 화면에 있다).
       body = Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-        SeatMapPreview(layout: layout, seats: _seatsApi, selected: _selected, onOpen: _openBigMap),
+        SeatMapPreview(layout: layout, seats: _seatsApi, selected: _selected, mine: _mineHere, onOpen: _openBigMap),
         const SizedBox(height: 10),
         OutlinedButton.icon(
           onPressed: _openBigMap,
@@ -1739,9 +2248,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } else {
       // 도면이 없는 열람실(또는 도면을 못 읽었을 때)에서만 쓰는 대체 화면: 번호 카드를 눌러 고른다.
       body = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const SeatLegend(),
+        SeatLegend(showMine: _mineHere != null),
         const SizedBox(height: 12),
-        SeatGrid(seats: _seats, selected: _selected, onTap: _toggle),
+        SeatGrid(seats: _seats, selected: _selected, mine: _mineHere, onTap: _toggle),
         const SizedBox(height: 10),
         ActionChip(
           avatar: const Icon(Icons.clear, size: 18),
@@ -1773,19 +2282,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final scheme = Theme.of(context).colorScheme;
     // 자동 연장만 할 거면(좌석을 안 골랐거나, 연장만 도는 중이면) "예약"이라고 부르지 않는다.
     final renewOnly = _autoRenew && (_phase == _Phase.idle ? _selected.isEmpty : !_huntRun);
+    // 좌석을 받은 뒤 자동 연장만 이어 가는 중이면 "시작"이 아니라 하고 있는 중이라고 보여 준다 (예약은 이미 끝났다).
+    final watchingOnly = _phase == _Phase.running && _runner == null && _renewer != null;
+    final got = watchingOnly ? _gotSeatTitle : null;
     return StepCard(
       step: 4,
-      title: renewOnly ? '자동 연장 시작' : '예약 시작',
+      title: watchingOnly ? '자동 연장 중' : (renewOnly ? '자동 연장 시작' : '예약 시작'),
+      subtitle: got,
+      done: got != null,
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         SizedBox(
           height: 52,
           child: FilledButton.icon(
             onPressed: switch (_phase) {
-              _Phase.idle => _start,
+              _Phase.idle => _keeping ? null : _start, // 좌석 유지가 도는 중에는 겹쳐 시작할 수 없다
               _Phase.running => _stop,
               _ => null, // 시작하는 중, 멈추는 중에는 누를 수 없다
             },
-            style: _phase == _Phase.running ? FilledButton.styleFrom(backgroundColor: scheme.error) : null,
+            // 빈 좌석을 노리는 중일 때만 빨간 "중지하기". 예약이 끝나고 연장만 지켜보는 중이면 "예약 중"처럼 보이지 않게 차분한 색이다.
+            style: _phase != _Phase.running
+                ? null
+                : (watchingOnly
+                    ? FilledButton.styleFrom(
+                        backgroundColor: scheme.secondaryContainer, foregroundColor: scheme.onSecondaryContainer)
+                    : FilledButton.styleFrom(backgroundColor: scheme.error)),
             icon: switch (_phase) {
               _Phase.idle => const Icon(Icons.play_arrow),
               _Phase.running => const Icon(Icons.stop),
@@ -1795,13 +2315,34 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               switch (_phase) {
                 _Phase.starting => '시작하는 중…',
                 _Phase.stopping => '멈추는 중…',
-                _Phase.running => '중지하기',
+                _Phase.running => watchingOnly ? '자동 연장 중지' : '중지하기',
                 _Phase.idle => _selected.isEmpty ? (_autoRenew ? '자동 연장만 시작' : '예약 시작') : '선택한 ${_selected.length}개 좌석 예약 시작',
               },
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
           ),
         ),
+        // 이미 좌석이 있는데 더 원하는 좌석을 기다리며 도는 중이면, 그 좌석은 그대로 두고 찾기만 멈출 수 있게 한다.
+        if (_phase == _Phase.running)
+          ValueListenableBuilder<RunStatus?>(
+            valueListenable: _runStatus,
+            builder: (context, s, _) {
+              final held = s?.heldCode;
+              if (_runner == null || held == null) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Text('지금 $held번 좌석을 갖고 있어요. 더 원하는 좌석이 나면 바꾸려고 계속 찾는 중이에요.'.keepWords,
+                      style: TextStyle(fontSize: 12.5, height: 1.4, color: scheme.onSurfaceVariant)),
+                  const SizedBox(height: 6),
+                  OutlinedButton(
+                    onPressed: _stopHuntOnly,
+                    child: Text('좌석 찾기만 멈추기${_renewer != null ? ' (자동 연장은 계속)' : ''}'),
+                  ),
+                ]),
+              );
+            },
+          ),
         // 도는 동안에는 위의 실행 배너가 자동 연장 상태를 보여 준다. 멈춰 있을 때만 켜짐/꺼짐을 알려 준다.
         if (!_running) ...[
           const SizedBox(height: 10),

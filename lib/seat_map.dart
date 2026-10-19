@@ -13,6 +13,7 @@ class SeatCanvas extends StatelessWidget {
     required this.layout,
     required this.seats,
     required this.selected,
+    this.mine,
     this.onTap,
   });
 
@@ -21,6 +22,9 @@ class SeatCanvas extends StatelessWidget {
   /// API 가 준 순서 그대로의 좌석 목록 (도면은 이 순번으로 좌석을 찾는다).
   final List<Seat> seats;
   final List<String> selected;
+
+  /// 이 열람실에서 내가 이미 예약해 갖고 있는 좌석 번호 (없으면 null). 다른 좌석과 색이 다르게 보인다.
+  final String? mine;
   final void Function(Seat)? onTap;
 
   @override
@@ -80,8 +84,14 @@ class SeatCanvas extends StatelessWidget {
     final seat = ls.index < seats.length ? seats[ls.index] : null;
     final order = seat == null ? -1 : selected.indexOf(seat.code);
     final remain = seat?.remainingMinutes;
+    final isMine = seat != null && mine != null && seat.code == mine;
     Color bg, bc, fg;
-    if (order >= 0) {
+    if (isMine) {
+      // 내가 예약한 좌석은 고른 좌석(분홍) 표시보다 우선한다. 이미 받은 좌석이라 "고르는 중"으로 보이면 안 된다.
+      bg = kMineBg;
+      bc = kMineBorder;
+      fg = Colors.white;
+    } else if (order >= 0) {
       bg = seat!.occupied ? kPicked.withValues(alpha: 0.78) : kPicked;
       bc = kPicked;
       fg = Colors.white;
@@ -128,7 +138,8 @@ class SeatCanvas extends StatelessWidget {
                         right: 0,
                         child: Text(compactRemaining(remain),
                             textAlign: TextAlign.center,
-                            style: TextStyle(fontSize: 10, color: order >= 0 ? Colors.white : const Color(0xFF616161), height: 1)),
+                            style: TextStyle(
+                                fontSize: 10, color: isMine || order >= 0 ? Colors.white : const Color(0xFF616161), height: 1)),
                       ),
                     ]),
             ),
@@ -165,12 +176,14 @@ class SeatMapPreview extends StatelessWidget {
     required this.seats,
     required this.selected,
     required this.onOpen,
+    this.mine,
   });
 
   final SeatLayout layout;
   final List<Seat> seats;
   final List<String> selected;
   final VoidCallback onOpen;
+  final String? mine;
 
   @override
   Widget build(BuildContext context) {
@@ -192,7 +205,7 @@ class SeatMapPreview extends StatelessWidget {
             aspectRatio: layout.width / layout.height,
             child: FittedBox(
               fit: BoxFit.contain,
-              child: IgnorePointer(child: SeatCanvas(layout: layout, seats: seats, selected: selected)),
+              child: IgnorePointer(child: SeatCanvas(layout: layout, seats: seats, selected: selected, mine: mine)),
             ),
           ),
         ),
@@ -210,6 +223,7 @@ class SeatMapView extends StatefulWidget {
     required this.seats,
     required this.selected,
     required this.onTap,
+    this.mine,
     this.initialScale = 0.9,
   });
 
@@ -217,6 +231,7 @@ class SeatMapView extends StatefulWidget {
   final List<Seat> seats;
   final List<String> selected;
   final void Function(Seat) onTap;
+  final String? mine;
 
   /// 처음 확대 배율. 좌석을 누르기 쉬운 크기로 시작한다 (도면이 더 작게 맞으면 그 크기).
   final double initialScale;
@@ -307,6 +322,7 @@ class _SeatMapViewState extends State<SeatMapView> {
                   layout: widget.layout,
                   seats: widget.seats,
                   selected: widget.selected,
+                  mine: widget.mine,
                   onTap: widget.onTap,
                 ),
               ),
@@ -342,11 +358,12 @@ class _SeatMapViewState extends State<SeatMapView> {
       );
 }
 
-/// 도면 범례. 홈페이지에서 읽은 구역 색에 "선택" 표시를 더한다.
+/// 도면 범례. 홈페이지에서 읽은 구역 색에 "선택" 표시를 더한다. [showMine] 이면 "내 좌석"도 보인다.
 class SeatMapLegend extends StatelessWidget {
-  const SeatMapLegend({super.key, required this.layout});
+  const SeatMapLegend({super.key, required this.layout, this.showMine = false});
 
   final SeatLayout layout;
+  final bool showMine;
 
   @override
   Widget build(BuildContext context) {
@@ -366,6 +383,7 @@ class SeatMapLegend extends StatelessWidget {
     return Wrap(spacing: 14, runSpacing: 6, children: [
       for (final l in layout.legend) item(l.bg, l.border, l.label),
       item(kPicked, kPicked, '내가 고른 좌석'),
+      if (showMine) item(kMineBg, kMineBorder, '내가 예약한 좌석'),
     ]);
   }
 }
@@ -379,6 +397,7 @@ class SeatMapPage extends StatelessWidget {
     required this.seats,
     required this.selected,
     required this.onTap,
+    this.mine,
     this.onClear,
   });
 
@@ -387,6 +406,9 @@ class SeatMapPage extends StatelessWidget {
   final List<Seat> seats;
   final List<String> selected;
   final void Function(Seat) onTap;
+
+  /// 이 열람실에서 내가 갖고 있는 좌석 번호 (없으면 null).
+  final String? mine;
 
   /// 고른 좌석을 모두 해제한다. null 이면(예약이 도는 중처럼 바꿀 수 없을 때) 버튼을 보이지 않는다.
   final VoidCallback? onClear;
@@ -412,9 +434,9 @@ class SeatMapPage extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.all(12),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            SeatMapLegend(layout: layout),
+            SeatMapLegend(layout: layout, showMine: mine != null),
             const SizedBox(height: 10),
-            Expanded(child: SeatMapView(layout: layout, seats: seats, selected: selected, onTap: onTap)),
+            Expanded(child: SeatMapView(layout: layout, seats: seats, selected: selected, mine: mine, onTap: onTap)),
           ]),
         ),
       ),
