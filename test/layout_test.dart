@@ -15,7 +15,7 @@ void main() {
   });
 
   test('이용 가능한 열람실 도면은 좌석 순번이 겹치거나 비지 않는다', () async {
-    for (final room in [53, 54]) {
+    for (final room in [53, 54, 62]) {
       final layout = (await SeatLayout.load(room))!;
       final idx = layout.seats.map((s) => s.index).toList()..sort();
       expect(idx, List.generate(idx.length, (i) => i), reason: 'room $room');
