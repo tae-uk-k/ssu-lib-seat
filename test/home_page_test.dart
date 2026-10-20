@@ -2502,6 +2502,84 @@ void main() {
     await _settle(tester, ms: 300);
   });
 
+  testWidgets('좌석 유지: "내 좌석 선택"은 지금 예약한 좌석을 1순위로 고르고, 이미 고른 좌석은 뒤로 간다', (tester) async {
+    SharedPreferences.setMockInitialValues({'keep_room': 53, 'keep_sel_53': ['5']});
+    final api = FakeLibrary(script: [_seats()], held: [mine(code: '7', inUse: false)]);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await openKeepSeat(tester);
+    expect(find.text('1순위 5번'), findsOneWidget);
+    expect(find.text('좌석 바꾸기'), findsOneWidget); // 옆에 "내 좌석 선택"이 나란히 있다
+    expect(find.text('내 좌석 선택'), findsOneWidget);
+
+    await tester.tap(find.text('내 좌석 선택'));
+    await _settleAnim(tester);
+    expect(find.text('1순위 7번 · 2순위 5번'), findsOneWidget);
+    expect(find.textContaining('7번 좌석을 1순위로 골랐어요'.keepWords), findsOneWidget);
+    expect((await SharedPreferences.getInstance()).getStringList('keep_sel_53'), ['7', '5']); // 저장된다
+    expect(api.calls, isEmpty); // 읽기만 했다
+  });
+
+  testWidgets('좌석 유지: 내 좌석이 이미 고른 목록에 있으면 맨 앞으로 옮긴다', (tester) async {
+    SharedPreferences.setMockInitialValues({'keep_room': 53, 'keep_sel_53': ['5', '7']});
+    final rig = Rig(api: FakeLibrary(script: [_seats()], held: [mine(code: '7')]));
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await openKeepSeat(tester);
+    expect(find.text('1순위 5번 · 2순위 7번'), findsOneWidget);
+    await tester.tap(find.text('내 좌석 선택'));
+    await _settleAnim(tester);
+    expect(find.text('1순위 7번 · 2순위 5번'), findsOneWidget);
+  });
+
+  testWidgets('좌석 유지: 열람실을 아직 안 골랐어도 "내 좌석 선택"으로 내 좌석의 열람실과 좌석을 한 번에 고른다', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final rig = Rig(api: FakeLibrary(script: [_seats()], held: [mine(code: '7')]));
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await openKeepSeat(tester);
+    expect(buttonEnabled(tester, '좌석 유지 시작'), isFalse);
+    expect(find.text('좌석 고르기'), findsNothing); // 열람실을 고르기 전에는 이 버튼이 없다
+    expect(find.text('내 좌석 선택'), findsOneWidget);
+
+    await tester.tap(find.text('내 좌석 선택'));
+    await _settleAnim(tester);
+    expect(find.text('1순위 7번'), findsOneWidget);
+    expect(find.textContaining('숭실스퀘어ON(2F)으로 바꾸고 7번 좌석을 골랐어요'.keepWords), findsOneWidget);
+    expect(buttonEnabled(tester, '좌석 유지 시작'), isTrue);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getInt('keep_room'), 53);
+    expect(prefs.getStringList('keep_sel_53'), ['7']);
+  });
+
+  testWidgets('좌석 유지: 내 좌석이 없거나, 고를 수 없는 열람실이거나, 읽지 못하면 알려 주고 고른 좌석은 그대로 둔다', (tester) async {
+    SharedPreferences.setMockInitialValues({'keep_room': 53, 'keep_sel_53': ['5']});
+    final api = FakeLibrary(script: [_seats()], held: []);
+    final rig = Rig(api: api);
+    await _pumpApp(tester, rig);
+    await _login(tester);
+    await openKeepSeat(tester);
+
+    await tester.tap(find.text('내 좌석 선택')); // 좌석이 없다
+    await _settleAnim(tester);
+    expect(find.text('지금 갖고 있는 좌석이 없어요.'.keepWords), findsOneWidget);
+    expect(find.text('1순위 5번'), findsOneWidget);
+
+    api.held.add(MyCharge(id: 901, seatId: 1, seatCode: '3', roomId: 99, roomName: '다른 열람실', returnable: true)); // 목록에 없는 열람실
+    await tester.tap(find.text('내 좌석 선택'));
+    await _settleAnim(tester);
+    expect(find.textContaining('고를 수 없는 열람실이에요'.keepWords), findsOneWidget);
+    expect(find.text('1순위 5번'), findsOneWidget);
+
+    api.held.clear();
+    api.heldFailure = Exception('서버 오류'); // 읽지 못한다
+    await tester.tap(find.text('내 좌석 선택'));
+    await _settleAnim(tester);
+    expect(find.text('내 좌석을 불러오지 못했어요. 잠시 뒤 다시 시도해 주세요.'.keepWords), findsOneWidget);
+    expect(find.text('1순위 5번'), findsOneWidget);
+  });
+
   testWidgets('새 버전이 없다고 나오면 확인한 시각을 기록해 둔다', (tester) async {
     final rig = Rig(); // 릴리스 없음
     await _pumpApp(tester, rig);

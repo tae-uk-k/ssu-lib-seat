@@ -1,3 +1,5 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -138,6 +140,7 @@ class KeepSeatPage extends StatefulWidget {
     required this.initial,
     required this.loadSeats,
     required this.loadLayout,
+    required this.loadMine,
     required this.onStart,
     required this.onStop,
     required this.onLogin,
@@ -164,6 +167,9 @@ class KeepSeatPage extends StatefulWidget {
 
   /// 열람실의 도면 (없으면 null).
   final Future<SeatLayout?> Function(int roomId) loadLayout;
+
+  /// 지금 내가 예약해 갖고 있는 좌석들을 서버에서 읽어 온다 ("내 좌석 선택" 버튼). 실패하면 예외를 던진다.
+  final Future<List<MyCharge>> Function() loadMine;
   final Future<void> Function(KeepSettings settings) onStart;
   final VoidCallback onStop;
   final Future<void> Function() onLogin;
@@ -188,6 +194,9 @@ class _KeepSeatPageState extends State<KeepSeatPage> {
   SeatLayout? _layout;
   bool _loadingSeats = false;
   String? _seatsError;
+  bool _loadingMine = false; // "내 좌석 선택" 으로 서버에서 읽어 오는 중
+  String? _mineNote; // 마지막 "내 좌석 선택" 결과 한 줄
+  bool _mineNoteBad = false;
 
   @override
   void initState() {
@@ -227,6 +236,62 @@ class _KeepSeatPageState extends State<KeepSeatPage> {
     } finally {
       if (mounted) setState(() => _loadingSeats = false);
     }
+  }
+
+  /// 지금 내가 예약해 갖고 있는 좌석을 1순위로 고른다. 그 좌석이 다른 열람실에 있으면 열람실도 그 방으로 바꾸고 이 좌석만 고른다.
+  Future<void> _pickMine() async {
+    if (_loadingMine) return;
+    setState(() {
+      _loadingMine = true;
+      _mineNote = null;
+    });
+    String note;
+    var bad = false;
+    try {
+      final list = await widget.loadMine();
+      if (!mounted) return;
+      if (list.isEmpty) {
+        note = '지금 갖고 있는 좌석이 없어요.';
+        bad = true;
+      } else {
+        final c = list.first;
+        final roomId = c.roomId;
+        final label = '${c.roomName.isEmpty ? '' : '${c.roomName} '}${c.seatCode}번 좌석';
+        if (roomId == null || !widget.rooms.any((r) => r.id == roomId)) {
+          note = '$label은 여기서 고를 수 없는 열람실이에요.';
+          bad = true;
+        } else if (roomId != _s.roomId) {
+          // 다른 열람실의 좌석이다: 그 열람실로 바꾸고 이 좌석만 고른다 (이전 열람실의 선택은 그 열람실에 저장돼 있다).
+          setState(() {
+            _seats = null;
+            _layout = null;
+            _seatsError = null;
+          });
+          _change(_s.copyWith(roomId: roomId, seats: [c.seatCode]));
+          unawaited(_loadRoom(roomId));
+          note = '${c.roomName.isEmpty ? '열람실' : c.roomName}으로 바꾸고 ${c.seatCode}번 좌석을 골랐어요.';
+        } else {
+          final next = [c.seatCode, ..._s.seats.where((x) => x != c.seatCode)];
+          _change(_s.copyWith(seats: next));
+          note = '${c.seatCode}번 좌석을 1순위로 골랐어요.';
+        }
+      }
+    } on LoginException {
+      note = '로그인에 실패했어요. 학번과 비밀번호를 확인해 주세요.';
+      bad = true;
+    } on SessionException {
+      note = '로그인이 풀렸어요. 다시 로그인해 주세요.';
+      bad = true;
+    } catch (_) {
+      note = '내 좌석을 불러오지 못했어요. 잠시 뒤 다시 시도해 주세요.';
+      bad = true;
+    }
+    if (!mounted) return;
+    setState(() {
+      _loadingMine = false;
+      _mineNote = note;
+      _mineNoteBad = bad;
+    });
   }
 
   Future<void> _pickRoom(Room r) async {
@@ -379,7 +444,7 @@ class _KeepSeatPageState extends State<KeepSeatPage> {
           Text('여러 개를 고르면 앞에 고른 좌석부터 잡아요.', style: dim),
           const SizedBox(height: 8),
           if (_s.roomId == null)
-            Text('먼저 열람실을 골라 주세요.', style: dim)
+            Text('먼저 열람실을 골라 주세요. 지금 예약한 좌석이 있으면 아래 "내 좌석 선택"으로 바로 고를 수 있어요.'.keepWords, style: dim)
           else if (_loadingSeats && _seats == null)
             const Padding(padding: EdgeInsets.all(8), child: Center(child: CircularProgressIndicator(strokeWidth: 2.4)))
           else if (_seatsError != null)
@@ -387,19 +452,35 @@ class _KeepSeatPageState extends State<KeepSeatPage> {
               Text(_seatsError!, style: TextStyle(fontSize: 12.5, color: scheme.error)),
               TextButton(onPressed: () => _loadRoom(_s.roomId!), child: const Text('다시 불러오기')),
             ])
-          else ...[
+          else
             Text(
                 _s.seats.isEmpty
                     ? '고른 좌석이 없어요.'
                     : [for (var i = 0; i < _s.seats.length; i++) '${i + 1}순위 ${_s.seats[i]}번'].join(' · '),
                 style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
+          const SizedBox(height: 8),
+          Wrap(spacing: 8, runSpacing: 6, children: [
+            if (_s.roomId != null && _seats != null)
+              OutlinedButton.icon(
+                onPressed: _pickSeats,
+                icon: const Icon(Icons.event_seat_outlined, size: 18),
+                label: Text(_s.seats.isEmpty ? '좌석 고르기' : '좌석 바꾸기'),
+              ),
+            // 지금 내가 예약해 갖고 있는 좌석을 바로 고른다 (열람실이 다르면 열람실도 바꾼다)
             OutlinedButton.icon(
-              onPressed: _seats == null ? null : _pickSeats,
-              icon: const Icon(Icons.event_seat_outlined, size: 18),
-              label: Text(_s.seats.isEmpty ? '좌석 고르기' : '좌석 바꾸기'),
+              onPressed: _loadingMine ? null : _pickMine,
+              icon: _loadingMine
+                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.person_pin_circle_outlined, size: 18),
+              label: Text(_loadingMine ? '확인하는 중…' : '내 좌석 선택'),
             ),
-          ],
+          ]),
+          if (_mineNote != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(_mineNote!.keepWords,
+                  style: TextStyle(fontSize: 12.5, height: 1.4, fontWeight: FontWeight.w600, color: _mineNoteBad ? scheme.error : kGreen)),
+            ),
         ]),
       ),
       _box(

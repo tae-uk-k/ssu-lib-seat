@@ -1234,6 +1234,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           initial: _keepSettings,
           loadSeats: _loadSeatsFor,
           loadLayout: widget.services.layoutFor,
+          loadMine: _loadMine,
           onStart: _startKeep,
           onStop: _stopKeep,
           onLogin: _login,
